@@ -554,25 +554,30 @@ def asked(session):
     return list(dict.fromkeys(call["text"] for call in session.calls))
 
 
-def start_interactive(monkeypatch, session, *values):
+def start_interactive(monkeypatch, session, *values, pasted=()):
+    """pasted — что отвечает проверка «в окне ещё есть вставленный текст» после пустых
+    строк, по очереди; по умолчанию — нет."""
     use_session(monkeypatch, session)
     monkeypatch.setattr(main.time, "sleep", lambda seconds: None)
     opened = []
     monkeypatch.setattr(main, "_open_file", opened.append)
-    return main.interactive(answers(*values)), opened
+    waiting = iter(pasted)
+    return main.interactive(answers(*values), lambda: next(waiting, False)), opened
 
 
 def test_interactive_two_questions_and_start(monkeypatch, capsys):
     session = FakeSession([ADS_PAGE])
-    # запросы, пустая строка, Enter «дальше», город, Enter на карточке
+    # запросы, пустая строка, город, Enter на карточке
     code, opened = start_interactive(monkeypatch, session, "купить духи", "парфюм магазин",
-                                     "", "", "Ставрополь", "")
+                                     "", "Ставрополь", "")
     assert code == main.EXIT_OK
     # по умолчанию в ручном режиме — 3 прогона
     assert [(c["text"], c["p"], c["lr"]) for c in session.calls] == [
         ("купить духи", 0, 36), ("парфюм магазин", 0, 36)] * main.INTERACTIVE_RUNS
     printed = capsys.readouterr().out
     assert "Шаг 1 из 2" in printed and "Шаг 2 из 2" in printed
+    assert "допишите" not in printed  # после пустой строки — сразу к городу
+    assert f"Все коды: {main.REGIONS_DOC}" in printed
     assert "1. Запросы: 2 (купить духи, парфюм магазин)" in printed
     assert "2. Город: Ставрополь (36)" in printed
     assert "3. Полнота: прогонов — 3, страниц на запрос — 1" in printed
@@ -584,7 +589,7 @@ def test_interactive_two_questions_and_start(monkeypatch, capsys):
 def test_interactive_card_items_can_be_changed(monkeypatch):
     session = QueueSession(ads_html("a.ru"), ads_html("b.ru"))
     code, opened = start_interactive(
-        monkeypatch, session, "окна", "", "", "36",
+        monkeypatch, session, "окна", "", "36",
         "3", "2 прогона", "", "4", "итог", "", "")
     assert code == main.EXIT_OK
     assert len(session.calls) == 2  # 2 прогона × 1 страница
@@ -598,7 +603,7 @@ def test_interactive_reasks_with_helpful_messages(monkeypatch, capsys):
     session = FakeSession([ADS_PAGE])
     code, _ = start_interactive(
         monkeypatch, session,
-        "", "купить духи", "", "",              # пустой ввод, потом запрос
+        "", "купить духи", "",                  # пустой ввод, потом запрос
         "Атлантида", "Ставропольский край", "",  # незнакомый город, похожий — «да»
         "7", "3", "11", "3-5", "x", "",          # неверный пункт, прогоны, страницы
         "")
@@ -620,20 +625,20 @@ def test_interactive_reasks_with_helpful_messages(monkeypatch, capsys):
 def test_interactive_region_forms(monkeypatch, typed, code):
     session = FakeSession([ADS_PAGE])
     extra = ("",) if typed == "краснадар" else ()  # «Может быть, Краснодар?» — да
-    start_interactive(monkeypatch, session, "окна", "", "", typed, *extra, "")
+    start_interactive(monkeypatch, session, "окна", "", typed, *extra, "")
     assert session.calls[0]["lr"] == code
 
 
 def test_interactive_city_is_required(monkeypatch, capsys):
     session = FakeSession([ADS_PAGE])
-    start_interactive(monkeypatch, session, "окна", "", "", "", "Россия", "")
+    start_interactive(monkeypatch, session, "окна", "", "", "Россия", "")
     assert "Укажите город" in capsys.readouterr().out
     assert session.calls[0]["lr"] == 225
 
 
 def test_interactive_region_list_and_unknown_code(monkeypatch, capsys):
     session = FakeSession([ADS_PAGE])
-    start_interactive(monkeypatch, session, "окна", "", "", "?", "999999", "0", "Сочи", "")
+    start_interactive(monkeypatch, session, "окна", "", "?", "999999", "0", "Сочи", "")
     printed = capsys.readouterr().out
     assert "Ставрополь 36" in printed and "aistudio.yandex.ru" in printed
     assert "Кода 999999 нет среди известных городов" in printed
@@ -642,21 +647,27 @@ def test_interactive_region_list_and_unknown_code(monkeypatch, capsys):
 
 def test_interactive_paste_with_blank_line_keeps_all_queries(monkeypatch):
     session = FakeSession([ADS_PAGE])
-    start_interactive(monkeypatch, session, "а", "б", "", "в", "", "", "36", "")
+    # после первой пустой строки в окне ещё есть вставленный текст — читаем дальше
+    start_interactive(monkeypatch, session, "а", "б", "", "в", "", "36", "", pasted=[True])
     assert asked(session) == ["а", "б", "в"]
+
+
+def test_pasted_text_check_is_quiet_without_terminal():
+    assert main._pasted_text_waiting() is False  # ввод тестов — не терминал
 
 
 def test_interactive_multiline_paste_in_one_input(monkeypatch):
     # readline со «вставкой целиком» отдаёт сразу несколько строк
     session = FakeSession([ADS_PAGE])
-    start_interactive(monkeypatch, session, "а\nб\n\nв", "", "", "36", "")
+    start_interactive(monkeypatch, session, "а\nб\n\nв", "", "36", "")
     assert asked(session) == ["а", "б", "в"]
 
 
 def test_interactive_comma_separated_queries_can_be_split(monkeypatch):
     session = FakeSession([ADS_PAGE])
+    # пустая строка, «Разделить?» — Enter, город, Enter на карточке
     start_interactive(monkeypatch, session, "купить духи, парфюм магазин, туалетная вода",
-                      "", "", "", "36", "")
+                      "", "", "36", "")
     assert asked(session) == ["купить духи", "парфюм магазин", "туалетная вода"]
 
 
@@ -665,7 +676,7 @@ def test_interactive_queries_from_dragged_file(monkeypatch, tmp_path):
     queries = tmp_path / "мои запросы.txt"
     queries.write_text("купить духи\nпарфюм магазин\n", encoding="utf-8")
     # Windows при перетаскивании файла в окно берёт путь в кавычки
-    start_interactive(monkeypatch, session, f'"{queries}"', "", "", "213", "")
+    start_interactive(monkeypatch, session, f'"{queries}"', "", "213", "")
     assert asked(session) == ["купить духи", "парфюм магазин"]
 
 
@@ -675,7 +686,7 @@ def test_interactive_file_typos_and_broken_files_are_not_queries(monkeypatch, tm
     broken = tmp_path / "отчёт.docx"
     broken.write_bytes(b"PK\x03\x04" + b"\x00" * 100)  # zip-архив, но не таблица
     start_interactive(monkeypatch, session, "/нет/такого/queris.txt", str(broken), "окна",
-                      "", "", "36", "")
+                      "", "36", "")
     printed = capsys.readouterr().out
     assert "Файл не найден: /нет/такого/queris.txt" in printed
     assert "не таблица Excel и не текст" in printed
@@ -686,7 +697,7 @@ def test_interactive_queries_from_dragged_excel(monkeypatch, tmp_path, capsys):
     session = FakeSession([ADS_PAGE])
     excel = make_excel(tmp_path / "запросы.xlsx", ["Ключевые слова", "купить духи",
                                                     "парфюм магазин"])
-    start_interactive(monkeypatch, session, str(excel), "", "", "36", "")
+    start_interactive(monkeypatch, session, str(excel), "", "36", "")
     assert "Из файла «запросы.xlsx» взято запросов: 2" in capsys.readouterr().out
     assert asked(session) == ["купить духи", "парфюм магазин"]
 
@@ -697,7 +708,7 @@ def test_interactive_finds_file_next_to_the_program(monkeypatch, tmp_path):
     elsewhere = tmp_path / "другая папка"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)  # программа запущена не из своей папки
-    start_interactive(monkeypatch, session, "queries.txt", "", "", "36", "")
+    start_interactive(monkeypatch, session, "queries.txt", "", "36", "")
     assert asked(session) == ["окна"]
 
 
@@ -707,9 +718,10 @@ def test_interactive_output_folder_existing_file_and_wrong_format(monkeypatch, t
     main.RESULTS_DIR.mkdir()
     old = main.RESULTS_DIR / "отчёт.xlsx"
     old.write_bytes("старый отчёт".encode())
-    start_interactive(monkeypatch, session, "окна", "", "", "36",
+    start_interactive(monkeypatch, session, "окна", "", "36",
                       "4", "отчёт.txt", "отчёт", "")
     printed = capsys.readouterr().out
+    assert "Форматы: .xlsx (Excel, по умолчанию), .csv, .json." in printed
     assert "Не знаете, что выбрать, — оставьте Excel." in printed and "'-'" not in printed
     assert "сохраню как «отчёт (2).xlsx»" in printed
     assert old.read_bytes() == "старый отчёт".encode()
@@ -717,14 +729,14 @@ def test_interactive_output_folder_existing_file_and_wrong_format(monkeypatch, t
 
     folder = tmp_path / "Мои отчёты"
     folder.mkdir()
-    start_interactive(monkeypatch, FakeSession([ADS_PAGE]), "окна", "", "", "36",
+    start_interactive(monkeypatch, FakeSession([ADS_PAGE]), "окна", "", "36",
                       "4", str(folder), "")
     assert len(list(folder.glob("ads_*.xlsx"))) == 1  # папка — сохраняем внутрь
 
 
 def test_interactive_cancel_and_eof(monkeypatch, capsys):
     session = FakeSession([ADS_PAGE])
-    code, _ = start_interactive(monkeypatch, session, "окна", "", "", "36", "0")
+    code, _ = start_interactive(monkeypatch, session, "окна", "", "36", "0")
     assert code == main.EXIT_USAGE and session.calls == []
     assert main.interactive(answers()) == main.EXIT_USAGE
     assert "Отменено" in capsys.readouterr().out

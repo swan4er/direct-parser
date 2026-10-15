@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -840,7 +841,20 @@ def _load_queries_file(path):
     return queries
 
 
-def _ask_queries(ask):
+def _pasted_text_waiting():
+    """Есть ли во вводе непрочитанный текст — остаток вставленного списка. Пустая строка
+    посреди вставки не должна заканчивать ввод: хвост списка ушёл бы в вопрос о городе."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            time.sleep(0.05)  # вставка доходит до консоли не мгновенно
+            return bool(msvcrt.kbhit())
+        return bool(select.select([sys.stdin], [], [], 0.05)[0])
+    except (OSError, ValueError):  # ввод не из терминала
+        return False
+
+
+def _ask_queries(ask, pasted_waiting=_pasted_text_waiting):
     say("Введите поисковые запросы по одному на строку или перетащите в это окно файл "
         "со списком: .txt или Excel (запросы в первой колонке). Когда закончите, нажмите "
         "Enter на пустой строке.", "dim")
@@ -853,12 +867,9 @@ def _ask_queries(ask):
             if not queries:
                 say("  Нужен хотя бы один запрос.", "yellow")
                 continue
-            say(f"  Запросов: {len(queries)} — {'; '.join(queries[:5])}"
-                f"{'; …' if len(queries) > 5 else ''}", "green")
-            more = ask("  Enter — дальше, или допишите ещё: ")
-            lines = [line for line in (clean_text(x) for x in more.splitlines()) if line]
-            if not lines:
-                break
+            if pasted_waiting():
+                continue  # пустая строка посреди вставленного списка — читаем дальше
+            break
         for line in lines:
             if _looks_like_path(line):
                 path = _find_file(line)
@@ -870,6 +881,8 @@ def _ask_queries(ask):
                 queries.append(line)
         queries = list(dict.fromkeys(queries))
 
+    say(f"  Запросов: {len(queries)} — {'; '.join(queries[:5])}"
+        f"{'; …' if len(queries) > 5 else ''}", "green")
     if any("," in query for query in queries) and _confirm(
             ask, "  Похоже, в некоторых строках несколько запросов через запятую. Разделить их?"):
         queries = list(dict.fromkeys(
@@ -905,6 +918,7 @@ def _ask_region(ask, current=None):
     с карточки Enter оставляет текущий."""
     say("Реклама сильно зависит от города. Введите город или код региона Яндекса; "
         "? — список городов, «Россия» — вся страна.", "dim")
+    say(f"Все коды: {REGIONS_DOC}", "dim")  # подпись короткая — ссылка влезает в 80 колонок
     prompt = f"Город [{_region_label(current)}]: " if current else "Город: "
     while True:
         value = clean_text(ask(prompt))
@@ -1009,8 +1023,8 @@ def _shown(path):
 
 
 def _ask_output(ask, current):
-    say("Просто имя файла — сохраню в папку results. Полный путь или папка — сохраню туда.",
-        "dim")
+    say("Просто имя файла — сохраню в папку results. Полный путь или папка — сохраню туда. "
+        "Форматы: .xlsx (Excel, по умолчанию), .csv, .json.", "dim")
     return _ask_until(ask, f"Файл [{_shown(current)}]: ", lambda v: _parse_output(v, current))
 
 
@@ -1037,7 +1051,7 @@ def _card(queries, region, runs, pages, output):
     say(f"  Сбор займёт около {_duration(seconds)}, обращений к Яндексу — до {count}.", "dim")
 
 
-def interactive(ask=input):
+def interactive(ask=input, pasted_waiting=_pasted_text_waiting):
     """Ручной режим: два вопроса (запросы и город), потом карточка — проверить и при
     необходимости поменять любой пункт, не начиная заново."""
     try:
@@ -1049,7 +1063,7 @@ def interactive(ask=input):
         "в папку results. Выход — Ctrl+C.\n", "dim")
     try:
         say("Шаг 1 из 2. Запросы", "bold")
-        queries = _ask_queries(ask)
+        queries = _ask_queries(ask, pasted_waiting)
         say("\nШаг 2 из 2. Город", "bold")
         region = _ask_region(ask)
         runs, pages = INTERACTIVE_RUNS, INTERACTIVE_PAGES
@@ -1063,7 +1077,7 @@ def interactive(ask=input):
                 say("Отменено.", "yellow")
                 return EXIT_USAGE
             if choice == "1":
-                queries = _ask_queries(ask)
+                queries = _ask_queries(ask, pasted_waiting)
             elif choice == "2":
                 region = _ask_region(ask, region)
             elif choice == "3":

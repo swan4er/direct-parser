@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 from openpyxl import load_workbook
 
 import main
@@ -56,7 +57,8 @@ class FakeSession:
 
 
 class QueueSession(FakeSession):
-    """Отдаёт страницы по очереди вызовов (удобно для прогонов); потом — «ничего не нашлось»."""
+    """Отдаёт страницы по очереди вызовов (удобно для прогонов); потом — «ничего не нашлось».
+    Исключение в очереди не отдаётся, а выбрасывается: так изображаются обрыв связи и Ctrl+C."""
 
     def __init__(self, *texts):
         super().__init__([])
@@ -64,7 +66,10 @@ class QueueSession(FakeSession):
 
     def get(self, url, params, timeout):
         self.calls.append(params)
-        return FakeResponse(self.texts.pop(0) if self.texts else NO_ADS_PAGE, self.url)
+        item = self.texts.pop(0) if self.texts else NO_ADS_PAGE
+        if isinstance(item, BaseException):
+            raise item
+        return FakeResponse(item, self.url)
 
 
 class FakeTTY(io.StringIO):
@@ -98,10 +103,12 @@ def read_json(path):
 
 
 def answers(*values):
-    """Подменяет input(): отдаёт ответы по очереди, а когда они кончились — EOF."""
+    """Подменяет input(): печатает приглашение, как настоящий input(), и отдаёт ответы
+    по очереди, а когда они кончились — EOF."""
     queue = iter(values)
 
     def ask(prompt=""):
+        print(prompt, end="")
         try:
             return next(queue)
         except StopIteration:
@@ -267,7 +274,7 @@ def test_cli_captcha_exit_code(monkeypatch, tmp_path):
 def test_cli_logs_request_estimate(monkeypatch, tmp_path, capsys):
     run_cli(monkeypatch, FakeSession([]), "а", "б", "-p", "3", "--runs", "2",
             "-o", str(tmp_path / "out.json"))
-    assert "Запросов к Яндексу: до 12" in capsys.readouterr().err
+    assert "Обращений к Яндексу: до 12" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("argv", [
@@ -333,6 +340,118 @@ def test_captcha_in_later_run_keeps_collected_ads(monkeypatch, tmp_path):
     assert [ad["domain"] for ad in data["ads"]] == ["a.ru"]
 
 
+# ---------- надёжность: остановки, сохранение, мусор во вводе ----------
+
+def test_key_codes_and_control_chars_are_removed_from_queries():
+    # стрелки без readline приходят как «^[[D» прямо в тексте
+    assert main.read_queries(["купить дхи\x1b[D\x1b[Dу", "парфюм\tмагазин\x07"]) == [
+        "купить дхиу", "парфюм магазин"]
+
+
+def test_xlsx_survives_control_characters(tmp_path):
+    out = tmp_path / "ads.xlsx"
+    ad = {"query": "купить\x1bдухи", "page": 1, "position": 1, "seen": 1, "domain": "a.ru",
+          "title": "Заголовок\x08", "description": "", "sitelinks": [], "label": "",
+          "click_url": ""}
+    main.write_output(str(out), [ad], [], 225)
+    assert list(load_workbook(out)["Объявления"].values)[1][0] == "купитьдухи"
+
+
+def test_captcha_stops_collection_and_marks_the_rest(monkeypatch, tmp_path, capsys):
+    session = QueueSession(ads_html("a.ru"), CAPTCHA_PAGE)
+    out = tmp_path / "out.json"
+    code = run_cli(monkeypatch, session, "первый", "второй", "третий", "-o", str(out))
+    assert code == main.EXIT_ERRORS
+    assert len(session.calls) == 2  # после капчи к Яндексу больше не ходим
+    queries = read_json(out)["queries"]
+    assert [q["status"] for q in queries] == ["ok", "captcha", "skipped"]
+    assert "капчу" in queries[2]["message"]
+    err = capsys.readouterr().err
+    assert "Собрано не всё" in err and "--proxy" in err
+
+
+def test_network_errors_stop_after_three_in_a_row(monkeypatch, tmp_path, capsys):
+    down = requests.ConnectionError("ProxyError(MaxRetryError(%D0%BA…))")
+    session = QueueSession(down, down, down, down)
+    out = tmp_path / "out.json"
+    assert run_cli(monkeypatch, session, *"абвгд", "-o", str(out)) == main.EXIT_ERRORS
+    assert len(session.calls) == main.MAX_NETWORK_ERRORS
+    queries = read_json(out)["queries"]
+    assert [q["status"] for q in queries] == ["error"] * 3 + ["skipped"] * 2
+    assert queries[0]["message"] == "нет связи с Яндексом (ConnectionError)."
+    err = capsys.readouterr().err
+    assert "%D0%BA" not in err  # вместо служебного текста — понятная причина
+
+
+def test_ctrl_c_keeps_what_was_collected(monkeypatch, tmp_path):
+    session = QueueSession(ads_html("a.ru"), KeyboardInterrupt())
+    out = tmp_path / "out.json"
+    assert run_cli(monkeypatch, session, "первый", "второй", "-o", str(out)) == main.EXIT_INTERRUPTED
+    data = read_json(out)
+    assert [ad["domain"] for ad in data["ads"]] == ["a.ru"]
+    assert data["queries"][1]["message"] == "Не обработан: сбор остановлен по Ctrl+C."
+
+
+def test_result_is_saved_after_each_query(monkeypatch, tmp_path):
+    # Падение посреди сбора (или закрытое окно) не уносит уже собранное
+    session = QueueSession(ads_html("a.ru"), RuntimeError("окно закрыли"))
+    out = tmp_path / "ads.xlsx"
+    with pytest.raises(RuntimeError):
+        run_cli(monkeypatch, session, "первый", "второй", "-o", str(out))
+    assert [row[4] for row in list(load_workbook(out)["Объявления"].values)[1:]] == ["a.ru"]
+
+
+def test_failed_write_falls_back_to_backup_json(monkeypatch, tmp_path, capsys):
+    real_write = main.write_output
+
+    def broken(output, *args, **kwargs):
+        if output.endswith(".xlsx"):
+            raise RuntimeError("что-то сломалось при записи")
+        return real_write(output, *args, **kwargs)
+
+    monkeypatch.setattr(main, "write_output", broken)
+    code = run_cli(monkeypatch, FakeSession([ADS_PAGE]), "купить духи", "-o", str(tmp_path / "a.xlsx"))
+    assert code == main.EXIT_ERRORS
+    backups = list(main.RESULTS_DIR.glob("backup_*.json"))
+    assert len(backups) == 1 and len(read_json(backups[0])["ads"]) == 2
+    err = capsys.readouterr().err
+    assert "запасной файл" in err and "Готово" not in err
+
+
+def test_unexpected_page_is_saved_for_the_developer(monkeypatch, tmp_path):
+    out = tmp_path / "out.json"
+    session = FakeSession(['<ul id="search-result"></ul>'])
+    assert run_cli(monkeypatch, session, "окна", "-o", str(out)) == main.EXIT_ERRORS
+    saved = list((main.RESULTS_DIR / "debug").glob("unexpected_*_окна.html"))
+    assert len(saved) == 1
+    assert str(saved[0]) in read_json(out)["queries"][0]["message"]
+
+
+@pytest.mark.parametrize("pages, expected", [
+    ([ADS_PAGE], "Готово"),
+    ([], "Объявлений нет"),
+    (['<ul id="search-result"></ul>'], "Не получилось"),
+])
+def test_final_message_matches_the_outcome(monkeypatch, tmp_path, capsys, pages, expected):
+    run_cli(monkeypatch, FakeSession(pages), "окна", "-o", str(tmp_path / "out.json"))
+    err = capsys.readouterr().err
+    assert expected in err
+    assert ("Готово" in err) == (expected == "Готово")
+
+
+def test_partial_result_is_not_called_done(monkeypatch, tmp_path, capsys):
+    session = QueueSession(ads_html("a.ru"), '<ul id="search-result"></ul>')
+    run_cli(monkeypatch, session, "первый", "второй", "-o", str(tmp_path / "out.json"))
+    assert "Собрано частично" in capsys.readouterr().err
+
+
+def test_human_hints_have_no_command_line_flags(monkeypatch, tmp_path, capsys, no_sleep):
+    use_session(monkeypatch, QueueSession(CAPTCHA_PAGE))
+    main.run(["окна"], output=str(tmp_path / "out.json"), human=True)
+    err = capsys.readouterr().err
+    assert "Подождите 15–30 минут" in err and "--" not in err
+
+
 # ---------- цвет ----------
 
 def test_paint_colors_only_real_terminals(monkeypatch):
@@ -376,55 +495,164 @@ def test_missing_dependency_is_explained():
     assert "pip install -r requirements.txt" in result.stderr.decode("utf-8")
 
 
-# ---------- пошаговый режим ----------
+# ---------- ручной режим: два вопроса и карточка ----------
 
-def test_interactive_typed_queries(monkeypatch, no_sleep):
-    session = use_session(monkeypatch, FakeSession([ads_html("a.ru", "b.ru"),
-                                                    ads_html("c.ru", "d.ru")]))
-    ask = answers("купить духи", "парфюм магазин", "", "Ставрополь", "2", "", "итог")
-    assert main.interactive(ask) == main.EXIT_OK
+def start_interactive(monkeypatch, session, *values):
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(main.time, "sleep", lambda seconds: None)
+    opened = []
+    monkeypatch.setattr(main, "_open_file", opened.append)
+    return main.interactive(answers(*values)), opened
 
+
+def test_interactive_two_questions_and_start(monkeypatch, capsys):
+    session = FakeSession([ADS_PAGE])
+    # запросы, пустая строка, Enter «дальше», город, Enter на карточке
+    code, opened = start_interactive(monkeypatch, session, "купить духи", "парфюм магазин",
+                                     "", "", "Ставрополь", "")
+    assert code == main.EXIT_OK
     assert [(c["text"], c["p"], c["lr"]) for c in session.calls] == [
-        ("купить духи", 0, 36), ("купить духи", 1, 36),
-        ("парфюм магазин", 0, 36), ("парфюм магазин", 1, 36)]
-    # просто имя файла — в папку results, расширение .xlsx подставляется
-    rows = list(load_workbook(main.RESULTS_DIR / "итог.xlsx")["Объявления"].values)
-    assert len(rows) == 1 + 8
+        ("купить духи", 0, 36), ("парфюм магазин", 0, 36)]
+    printed = capsys.readouterr().out
+    assert "Шаг 1 из 2" in printed and "Шаг 2 из 2" in printed
+    assert "1. Запросы: 2 (купить духи, парфюм магазин)" in printed
+    assert "2. Город: Ставрополь (36)" in printed
+    assert "обращений к Яндексу — до 2" in printed
+    assert len(list(main.RESULTS_DIR.glob("ads_*.xlsx"))) == 1
+    assert opened == []  # на «Открыть таблицу?» ответа не было (EOF) — не открываем
 
 
-def test_interactive_reasks_and_uses_defaults(monkeypatch, capsys, no_sleep):
-    session = use_session(monkeypatch, FakeSession([ADS_PAGE]))
-    ask = answers("", "купить духи", "", "Атлантида", "", "0", "x", "", "11", "", "")
-    assert main.interactive(ask) == main.EXIT_OK
+def test_interactive_card_items_can_be_changed(monkeypatch):
+    session = QueueSession(ads_html("a.ru"), ads_html("b.ru"))
+    code, opened = start_interactive(
+        monkeypatch, session, "окна", "", "", "36",
+        "3", "2 прогона", "", "4", "итог", "", "")
+    assert code == main.EXIT_OK
+    assert len(session.calls) == 2  # 2 прогона × 1 страница
+    output = main.RESULTS_DIR / "итог.xlsx"
+    assert [row[4] for row in list(load_workbook(output)["Объявления"].values)[1:]] == [
+        "a.ru", "b.ru"]
+    assert opened == [str(output)]  # Enter на «Открыть таблицу?»
 
+
+def test_interactive_reasks_with_helpful_messages(monkeypatch, capsys):
+    session = FakeSession([ADS_PAGE])
+    code, _ = start_interactive(
+        monkeypatch, session,
+        "", "купить духи", "", "",              # пустой ввод, потом запрос
+        "Атлантида", "Ставропольский край", "",  # незнакомый город, похожий — «да»
+        "7", "3", "11", "3-5", "x", "",          # неверный пункт, прогоны, страницы
+        "")
+    assert code == main.EXIT_OK
     printed = capsys.readouterr().out
     assert "Нужен хотя бы один запрос" in printed
-    assert "Не знаю региона «Атлантида»" in printed
-    assert "Регион: Россия (225)" in printed
-    assert "Нужно целое число от 1." in printed
-    assert f"Нужно целое число от 1 до {main.MAX_RUNS}." in printed
-    assert session.calls[0]["lr"] == 225 and len(session.calls) == 1
-    assert len(list(main.RESULTS_DIR.glob("ads_*.xlsx"))) == 1
+    assert "Такого города в списке нет" in printed
+    assert "Может быть, Ставрополь (36)?" in printed
+    assert "цифру от 1 до 4" in printed
+    assert f"Нужно число от 1 до {main.MAX_RUNS}." in printed
+    assert "Введите число, например 3." in printed
+    # «3-5» — берётся первое число: 3 прогона
+    assert [c["lr"] for c in session.calls] == [36, 36, 36]
 
 
-def test_interactive_runs(monkeypatch, no_sleep):
-    session = use_session(monkeypatch, QueueSession(ads_html("a.ru"), ads_html("b.ru")))
-    assert main.interactive(answers("окна", "", "", "", "2", "итог.json")) == main.EXIT_OK
-    assert len(session.calls) == 2
-    data = read_json(main.RESULTS_DIR / "итог.json")
-    assert (data["runs"], [ad["domain"] for ad in data["ads"]]) == (2, ["a.ru", "b.ru"])
+@pytest.mark.parametrize("typed, code", [
+    ("36 Ставрополь", 36), ("мск", 213), ("краснадар", 35), ("", 225),
+])
+def test_interactive_region_forms(monkeypatch, typed, code):
+    session = FakeSession([ADS_PAGE])
+    extra = ("",) if typed == "краснадар" else ()  # «Может быть, Краснодар?» — да
+    start_interactive(monkeypatch, session, "окна", "", "", typed, *extra, "")
+    assert session.calls[0]["lr"] == code
 
 
-def test_interactive_queries_from_dragged_file(monkeypatch, tmp_path, no_sleep):
-    session = use_session(monkeypatch, FakeSession([ADS_PAGE]))
+def test_interactive_region_list_and_unknown_code(monkeypatch, capsys):
+    session = FakeSession([ADS_PAGE])
+    start_interactive(monkeypatch, session, "окна", "", "", "?", "999999", "0", "Сочи", "")
+    printed = capsys.readouterr().out
+    assert "Ставрополь 36" in printed and "aistudio.yandex.ru" in printed
+    assert "Кода 999999 нет среди известных городов" in printed
+    assert session.calls[0]["lr"] == 239
+
+
+def test_interactive_paste_with_blank_line_keeps_all_queries(monkeypatch):
+    session = FakeSession([ADS_PAGE])
+    start_interactive(monkeypatch, session, "а", "б", "", "в", "", "", "36", "")
+    assert [c["text"] for c in session.calls] == ["а", "б", "в"]
+
+
+def test_interactive_multiline_paste_in_one_input(monkeypatch):
+    # readline со «вставкой целиком» отдаёт сразу несколько строк
+    session = FakeSession([ADS_PAGE])
+    start_interactive(monkeypatch, session, "а\nб\n\nв", "", "", "36", "")
+    assert [c["text"] for c in session.calls] == ["а", "б", "в"]
+
+
+def test_interactive_comma_separated_queries_can_be_split(monkeypatch):
+    session = FakeSession([ADS_PAGE])
+    start_interactive(monkeypatch, session, "купить духи, парфюм магазин, туалетная вода",
+                      "", "", "", "36", "")
+    assert [c["text"] for c in session.calls] == [
+        "купить духи", "парфюм магазин", "туалетная вода"]
+
+
+def test_interactive_queries_from_dragged_file(monkeypatch, tmp_path):
+    session = FakeSession([ADS_PAGE])
     queries = tmp_path / "мои запросы.txt"
     queries.write_text("купить духи\nпарфюм магазин\n", encoding="utf-8")
-    out = tmp_path / "out.json"
     # Windows при перетаскивании файла в окно берёт путь в кавычки
-    ask = answers(f'"{queries}"', "213", "", "", str(out))
-    assert main.interactive(ask) == main.EXIT_OK
+    start_interactive(monkeypatch, session, f'"{queries}"', "", "", "213", "")
     assert [c["text"] for c in session.calls] == ["купить духи", "парфюм магазин"]
-    assert read_json(out)["region"] == 213
+
+
+def test_interactive_file_typos_and_excel_are_not_queries(monkeypatch, tmp_path, capsys):
+    session = FakeSession([ADS_PAGE])
+    excel = tmp_path / "запросы.xlsx"
+    excel.write_bytes(b"PK\x03\x04" + b"\x00" * 100)  # xlsx внутри — zip-архив
+    start_interactive(monkeypatch, session, "/нет/такого/queris.txt", str(excel), "окна",
+                      "", "", "36", "")
+    printed = capsys.readouterr().out
+    assert "Файл не найден: /нет/такого/queris.txt" in printed
+    assert "не текстовый файл" in printed
+    assert [c["text"] for c in session.calls] == ["окна"]
+
+
+def test_interactive_finds_file_next_to_the_program(monkeypatch, tmp_path):
+    session = FakeSession([ADS_PAGE])
+    (main.RESULTS_DIR.parent / "queries.txt").write_text("окна\n", encoding="utf-8")
+    elsewhere = tmp_path / "другая папка"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # программа запущена не из своей папки
+    start_interactive(monkeypatch, session, "queries.txt", "", "", "36", "")
+    assert [c["text"] for c in session.calls] == ["окна"]
+
+
+def test_interactive_output_folder_existing_file_and_wrong_format(monkeypatch, tmp_path,
+                                                                    capsys):
+    session = FakeSession([ADS_PAGE])
+    main.RESULTS_DIR.mkdir()
+    old = main.RESULTS_DIR / "отчёт.xlsx"
+    old.write_bytes("старый отчёт".encode())
+    start_interactive(monkeypatch, session, "окна", "", "", "36",
+                      "4", "отчёт.txt", "отчёт", "")
+    printed = capsys.readouterr().out
+    assert "Не знаете, что выбрать, — оставьте Excel." in printed and "'-'" not in printed
+    assert "сохраню как «отчёт (2).xlsx»" in printed
+    assert old.read_bytes() == "старый отчёт".encode()
+    assert (main.RESULTS_DIR / "отчёт (2).xlsx").exists()
+
+    folder = tmp_path / "Мои отчёты"
+    folder.mkdir()
+    start_interactive(monkeypatch, FakeSession([ADS_PAGE]), "окна", "", "", "36",
+                      "4", str(folder), "")
+    assert len(list(folder.glob("ads_*.xlsx"))) == 1  # папка — сохраняем внутрь
+
+
+def test_interactive_cancel_and_eof(monkeypatch, capsys):
+    session = FakeSession([ADS_PAGE])
+    code, _ = start_interactive(monkeypatch, session, "окна", "", "", "36", "0")
+    assert code == main.EXIT_USAGE and session.calls == []
+    assert main.interactive(answers()) == main.EXIT_USAGE
+    assert "Отменено" in capsys.readouterr().out
 
 
 def test_clean_path_unescapes_macos_drag_and_drop():
@@ -433,6 +661,38 @@ def test_clean_path_unescapes_macos_drag_and_drop():
     assert main._clean_path(r"/Users/me/My\ Files/q.txt ") == "/Users/me/My Files/q.txt"
 
 
-def test_interactive_eof_cancels(capsys):
-    assert main.interactive(answers()) == main.EXIT_USAGE
-    assert "Отменено" in capsys.readouterr().out
+def test_long_lines_wrap_by_words(monkeypatch):
+    monkeypatch.setattr(main.sys, "stdout", FakeTTY())
+    monkeypatch.setattr(main.shutil, "get_terminal_size", lambda: os.terminal_size((41, 24)))
+    text = "  " + "Реклама сильно зависит от города Ставрополь и Ростов-на-Дону " * 2
+    lines = main._wrap(text).split("\n")
+    assert all(len(line) <= 40 for line in lines)
+    assert all(line.startswith("  ") for line in lines)  # отступ сохраняется
+    assert "Ростов-на-Дону" in main._wrap(text)  # слова и дефисы не рвутся
+
+
+def test_offer_install_declined_and_accepted(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "0")
+    assert main._offer_install("bs4") == 1
+    assert "pip install -r" in capsys.readouterr().out
+
+    calls = []
+
+    class FakeChild:
+        def __init__(self, command):
+            calls.append(command)
+
+        def wait(self):
+            return 0
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main.subprocess, "Popen", FakeChild)
+    monkeypatch.setattr(main.signal, "signal", lambda *args: None)
+    assert main._offer_install("bs4") == 0
+    assert calls[0][1:4] == ["-m", "pip", "install"]
+    assert calls[1] == [sys.executable, *sys.argv]  # после установки — перезапуск

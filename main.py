@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Сбор рекламных объявлений Яндекс.Директа со страницы yandex.ru/search/ads.
 
-Без аргументов в терминале — пошаговый режим: программа сама спрашивает запросы,
-регион, число страниц и прогонов, имя файла. С аргументами — режим для скриптов
-и агентов (python main.py --help). Ход работы пишется в stderr, данные — в файл
-(по умолчанию в папку results) или в stdout.
+Без аргументов в терминале — ручной режим: программа спрашивает запросы и город,
+показывает карточку с настройками и временем сбора, любую строку можно поменять.
+С аргументами — режим для скриптов и агентов (python main.py --help). Ход работы
+пишется в stderr, данные — в файл (по умолчанию в папку results) или в stdout.
 """
 
 import argparse
 import codecs
 import csv
+import difflib
 import json
 import os
 import re
+import shutil
+import signal
+import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -40,18 +45,48 @@ def _pause():
             pass
 
 
+def _offer_install(missing):
+    """Новичку «pip install» ничего не говорит — предлагаем поставить библиотеки сами
+    и перезапускаем программу. Возвращает код выхода."""
+    requirements = Path(__file__).resolve().parent / "requirements.txt"
+    manual = f'{sys.executable} -m pip install -r "{requirements}"'
+    print(f"Программе нужны дополнительные библиотеки Python (не хватает «{missing}»). "
+          "Их можно установить автоматически, нужен интернет.")
+    try:
+        answer = input("Установить сейчас? Enter — да, 0 — нет: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        answer = "0"
+    if answer == "0":
+        print(f"Установить можно и вручную, командой:\n  {manual}")
+        _pause()
+        return 1
+    if subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(requirements)]).returncode:
+        print("Установить не получилось — причина выше. Инструкция по установке — "
+              f"в README.md, раздел «Установка». Команда для ручной установки:\n  {manual}")
+        _pause()
+        return 1
+    print("Библиотеки установлены. Запускаю программу…\n")
+    child = subprocess.Popen([sys.executable, *sys.argv])
+    # Ctrl+C обрабатывает запущенная программа: она сохраняет собранное. Если бы этот
+    # процесс тоже прервался, он убил бы её на середине записи.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    return child.wait()
+
+
 try:
     import requests
     from bs4 import BeautifulSoup
     from openpyxl import Workbook
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
     from openpyxl.styles import Font
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
 except ImportError as exc:
     _utf8_stdio()
+    if _launched_interactively():
+        sys.exit(_offer_install(exc.name))
     print(f"Не установлена библиотека {exc.name}. Выполните: pip install -r requirements.txt",
           file=sys.stderr)
-    _pause()
     sys.exit(1)
 
 BASE_URL = "https://yandex.ru/search/ads"
@@ -114,16 +149,25 @@ SECONDS_PER_REQUEST = 0.7  # средний ответ Яндекса в том 
 
 # Коды выхода
 EXIT_OK = 0  # собрано хотя бы одно объявление, ошибок нет
-EXIT_ERRORS = 1  # капча, сетевая ошибка или незнакомая вёрстка хотя бы по одному запросу
+EXIT_ERRORS = 1  # капча, нет связи, незнакомая вёрстка или необработанные запросы
 EXIT_USAGE = 2  # неверные аргументы (этот же код возвращает argparse)
 EXIT_NO_ADS = 3  # ошибок нет, но Яндекс не показал ни одного объявления
+EXIT_INTERRUPTED = 130  # остановлено по Ctrl+C (собранное сохранено)
 
-ERROR_STATUSES = {"captcha", "error", "unexpected"}
+MAX_NETWORK_ERRORS = 3  # столько ошибок связи подряд — и сбор останавливается
+TIMEOUT = (10, 30)  # секунд: на соединение и на ответ
+
+# skipped — до запроса не дошли: сбор остановлен раньше
+ERROR_STATUSES = {"captcha", "error", "unexpected", "skipped"}
 STATUS_MESSAGES = {
     "no_ads": "Яндекс ответил «ничего не нашлось».",
-    "captcha": "Яндекс показал капчу: увеличьте --delay или смените IP (--proxy).",
-    "unexpected": "Ни объявлений, ни пометки «ничего не нашлось» — вероятно, Яндекс поменял "
-                  "вёрстку. Сохраните страницу через --save-html и проверьте селекторы.",
+    "captcha": "Яндекс показал капчу.",
+    "unexpected": "Незнакомая страница: похоже, Яндекс поменял вёрстку.",
+}
+STOP_MESSAGES = {
+    "captcha": "Яндекс показал капчу — сбор остановлен",
+    "network": f"нет связи с Яндексом {MAX_NETWORK_ERRORS} раза подряд — сбор остановлен",
+    "interrupted": "сбор остановлен по Ctrl+C",
 }
 
 
@@ -169,8 +213,22 @@ def log(message, *styles):
     print(paint(message, *styles, stream=sys.stderr), file=sys.stderr, flush=True)
 
 
+def _wrap(text):
+    """Длинные строки — по словам под ширину окна, иначе терминал рвёт слова («Вых|од»)."""
+    if not sys.stdout.isatty():
+        return text
+    width = max(40, shutil.get_terminal_size().columns - 1)
+    lines = []
+    for line in text.split("\n"):
+        indent = line[:len(line) - len(line.lstrip())]
+        lines.append(textwrap.fill(line.strip(), width, initial_indent=indent,
+                                   subsequent_indent=indent, break_long_words=False,
+                                   break_on_hyphens=False) if line.strip() else line)
+    return "\n".join(lines)
+
+
 def say(message="", *styles):
-    print(paint(message, *styles, stream=sys.stdout))
+    print(paint(_wrap(message), *styles, stream=sys.stdout))
 
 
 # ---------- Регионы и запросы ----------
@@ -205,15 +263,36 @@ def _decode(data):
         return data.decode("cp1251", errors="replace")
 
 
+# Служебные коды клавиш: стрелка без модуля readline даёт «^[[D» прямо в тексте
+_KEY_CODES = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|O.|.)?")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean_text(text):
+    """Убирает из введённого текста коды клавиш и управляющие символы, лишние пробелы."""
+    return " ".join(_CONTROL_CHARS.sub(" ", _KEY_CODES.sub("", text)).split())
+
+
+def _file_text(path):
+    """Текст файла запросов. Excel и другие не текстовые файлы — понятная ошибка
+    (ValueError), а не сотни «запросов» из байтов архива."""
+    data = Path(path).read_bytes()
+    utf16 = data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+    if not utf16 and (data.startswith(b"PK\x03\x04") or b"\x00" in data[:4096]):
+        raise ValueError(f"«{Path(path).name}» — не текстовый файл. Нужен .txt с запросами "
+                         "по одному на строку (в Excel: «Сохранить как» → «Текст»).")
+    return _decode(data)
+
+
 def read_queries(arg_queries, file_path=None):
     """Собирает запросы из аргументов и файла ("-" — stdin), убирает пустые строки,
-    комментарии (#) и дубли, сохраняя порядок."""
+    комментарии (#), служебные символы и дубли, сохраняя порядок."""
     lines = list(arg_queries)
     if file_path == "-":
         lines += _decode(sys.stdin.buffer.read()).splitlines()
     elif file_path:
-        lines += _decode(Path(file_path).read_bytes()).splitlines()
-    cleaned = (line.strip() for line in lines)
+        lines += _file_text(file_path).splitlines()
+    cleaned = (clean_text(line) for line in lines)
     return list(dict.fromkeys(q for q in cleaned if q and not q.startswith("#")))
 
 
@@ -262,7 +341,10 @@ def parse_page(html, final_url=""):
 def make_session(proxy=None):
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9"})
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
+    # Перегрузка Яндекса (429, 5xx) проходит сама — до трёх повторов с паузой. Обрыв связи
+    # повторять почти бесполезно — один повтор, иначе каждое обращение ждёт секунды
+    retry = Retry(total=3, connect=1, backoff_factor=1,
+                  status_forcelist=(429, 500, 502, 503, 504))
     session.mount("https://", HTTPAdapter(max_retries=retry))
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
@@ -270,92 +352,161 @@ def make_session(proxy=None):
 
 
 def _problem(info, status, message):
-    """Ошибка важнее «ok» и «no_ads»; из нескольких ошибок запоминается первая."""
-    if info["status"] not in ERROR_STATUSES:
+    """Ошибка важнее «ok», «no_ads» и «skipped»; из нескольких ошибок запоминается первая."""
+    if info["status"] not in ERROR_STATUSES - {"skipped"}:
         info.update(status=status, message=message)
 
 
-def collect(session, queries, pages=1, region=225, delay=1.0, runs=1, save_html=None):
+def _network_reason(exc):
+    """Понятная причина вместо «ProxyError(MaxRetryError(…%D0%BA…))»."""
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"Яндекс ответил ошибкой {exc.response.status_code}"
+    if isinstance(exc, requests.exceptions.RetryError):
+        return "Яндекс не отвечает: ошибка на его стороне"
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return "нет связи с Яндексом"
+    return f"ошибка сети ({type(exc).__name__})"
+
+
+def _safe_name(query):
+    return re.sub(r"[^\w-]+", "_", query)[:60]
+
+
+def _save_unexpected(query, html):
+    """Незнакомую страницу сохраняем сами — по ней можно обновить разбор."""
+    path = RESULTS_DIR / "debug" / (
+        f"unexpected_{time.strftime('%Y-%m-%d_%H-%M-%S')}_{_safe_name(query)}.html")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html, encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def _snapshot(merged, summary, queries, stop=None):
+    """Текущий результат: объявления по порядку запросов и позиций, сводка по запросам."""
+    order = {query: index for index, query in enumerate(queries)}
+    ads = sorted(merged.values(), key=lambda ad: (order[ad["query"]], ad["position"]))
+    rows = []
+    for query in queries:
+        info = dict(summary[query], ads=sum(1 for ad in ads if ad["query"] == query))
+        if info["status"] == "no_ads":
+            info["message"] = STATUS_MESSAGES["no_ads"]
+        elif info["status"] == "skipped":
+            info["message"] = (f"Не обработан: {STOP_MESSAGES[stop]}." if stop
+                               else "Ещё не обработан.")
+        rows.append(info)
+    return ads, rows
+
+
+def collect(session, queries, pages=1, region=225, delay=1.0, runs=1, save_html=None,
+            on_progress=None):
     """Обходит запросы и страницы runs раз и объединяет прогоны: Яндекс каждый раз
     показывает немного разный набор объявлений. Одинаковые объявления (тот же домен,
     заголовок и текст) склеиваются: считается, в скольких прогонах они встретились,
-    и остаётся лучшая позиция. Возвращает (объявления, сводка по запросам)."""
+    и остаётся лучшая позиция.
+
+    Останавливается на первой капче (дальше Яндекс будет показывать только её),
+    после MAX_NETWORK_ERRORS ошибок связи подряд и по Ctrl+C — собранное не теряется.
+    on_progress(объявления, сводка) вызывается после каждого запроса: так результат
+    можно сохранять по ходу. Возвращает (объявления, сводка, причина остановки или None)."""
     merged = {}
-    summary = {query: {"query": query, "status": "no_ads", "runs_with_ads": 0, "pages": 0,
+    summary = {query: {"query": query, "status": "skipped", "runs_with_ads": 0, "pages": 0,
                        "ads": 0, "message": ""} for query in queries}
     first_request = True
-    # Сначала все запросы, потом следующий прогон — между повторами больше времени
-    for run_number in range(1, runs + 1):
-        for number, query in enumerate(queries, 1):
-            info = summary[query]
-            seen_now = set()
-            position = 0
-            for page in range(pages):
-                if not first_request and delay:
-                    time.sleep(delay)
-                first_request = False
-                prefix = f"[{number}/{len(queries)}] «{query}», стр. {page + 1}"
-                if runs > 1:
-                    prefix = f"[прогон {run_number}/{runs}] {prefix}"
-                try:
-                    response = session.get(
-                        BASE_URL, params={"text": query, "p": page, "lr": region}, timeout=30
-                    )
-                    response.raise_for_status()
-                except requests.RequestException as exc:
-                    _problem(info, "error", str(exc))
-                    log(f"{prefix}: ошибка сети — {exc}", "red")
+    network_errors = 0
+    stop = None
+    try:
+        # Сначала все запросы, потом следующий прогон — между повторами больше времени
+        for run_number in range(1, runs + 1):
+            for number, query in enumerate(queries, 1):
+                info = summary[query]
+                seen_now = set()
+                position = 0
+                for page in range(pages):
+                    if not first_request and delay:
+                        time.sleep(delay)
+                    first_request = False
+                    prefix = f"[{number}/{len(queries)}] «{query}», стр. {page + 1}"
+                    if runs > 1:
+                        prefix = f"[прогон {run_number}/{runs}] {prefix}"
+                    try:
+                        response = session.get(
+                            BASE_URL, params={"text": query, "p": page, "lr": region}, timeout=TIMEOUT
+                        )
+                        response.raise_for_status()
+                    except requests.RequestException as exc:
+                        reason = _network_reason(exc)
+                        _problem(info, "error", f"{reason} ({type(exc).__name__}).")
+                        log(f"{prefix}: {reason}.", "red")
+                        network_errors += 1
+                        if network_errors >= MAX_NETWORK_ERRORS:
+                            stop = "network"
+                        break
+                    network_errors = 0
+                    if info["status"] == "skipped":
+                        info["status"] = "no_ads"
+
+                    if save_html:
+                        run_suffix = f"_r{run_number}" if runs > 1 else ""
+                        path = Path(save_html) / (
+                            f"{number:03d}_{_safe_name(query)}_p{page + 1}{run_suffix}.html")
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(response.text, encoding="utf-8")
+
+                    parsed = parse_page(response.text, response.url)
+                    info["pages"] = max(info["pages"], page + 1)
+
+                    if not parsed["ads"]:
+                        # На первой странице пустой ответ — результат запроса; дальше —
+                        # конец списка объявлений. Капча — ошибка на любой странице.
+                        status = parsed["status"]
+                        if status == "captcha":
+                            _problem(info, "captcha", STATUS_MESSAGES["captcha"])
+                            log(f"{prefix}: {STATUS_MESSAGES['captcha']}", "red")
+                            stop = "captcha"
+                        elif status == "unexpected" and page == 0:
+                            saved = _save_unexpected(query, response.text)
+                            message = STATUS_MESSAGES["unexpected"]
+                            if saved:
+                                message += f" Страница сохранена: {saved}"
+                            _problem(info, "unexpected", message)
+                            log(f"{prefix}: {message}", "red")
+                        elif page == 0:
+                            log(f"{prefix}: {STATUS_MESSAGES['no_ads']}", "yellow")
+                        else:
+                            log(f"{prefix}: объявления закончились.", "dim")
+                        break
+
+                    for ad in parsed["ads"]:
+                        position += 1
+                        key = (query, ad["domain"], ad["title"], ad["description"])
+                        known = merged.get(key)
+                        if known is None:
+                            known = merged[key] = {"query": query, "page": page + 1,
+                                                   "position": position, "seen": 0, **ad}
+                        elif position < known["position"]:
+                            known.update(page=page + 1, position=position)
+                        if key not in seen_now:
+                            seen_now.add(key)
+                            known["seen"] += 1
+                    log(f"{prefix}: объявлений — {len(parsed['ads'])}", "green")
+
+                if seen_now:
+                    info["runs_with_ads"] += 1
+                    if info["status"] == "no_ads":
+                        info["status"] = "ok"
+                if on_progress:
+                    on_progress(*_snapshot(merged, summary, queries))
+                if stop:
                     break
-
-                if save_html:
-                    safe_name = re.sub(r"[^\w-]+", "_", query)[:60]
-                    run_suffix = f"_r{run_number}" if runs > 1 else ""
-                    path = Path(save_html) / f"{number:03d}_{safe_name}_p{page + 1}{run_suffix}.html"
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(response.text, encoding="utf-8")
-
-                parsed = parse_page(response.text, response.url)
-                info["pages"] = max(info["pages"], page + 1)
-
-                if not parsed["ads"]:
-                    # На первой странице пустой ответ — результат запроса; дальше — конец
-                    # списка объявлений. Капча — ошибка на любой странице.
-                    status = parsed["status"]
-                    if status == "captcha" or (page == 0 and status == "unexpected"):
-                        _problem(info, status, STATUS_MESSAGES[status])
-                        log(f"{prefix}: {STATUS_MESSAGES[status]}", "red")
-                    elif page == 0:
-                        log(f"{prefix}: {STATUS_MESSAGES['no_ads']}", "yellow")
-                    else:
-                        log(f"{prefix}: объявления закончились.", "dim")
-                    break
-
-                for ad in parsed["ads"]:
-                    position += 1
-                    key = (query, ad["domain"], ad["title"], ad["description"])
-                    known = merged.get(key)
-                    if known is None:
-                        known = merged[key] = {"query": query, "page": page + 1,
-                                               "position": position, "seen": 0, **ad}
-                    elif position < known["position"]:
-                        known.update(page=page + 1, position=position)
-                    if key not in seen_now:
-                        seen_now.add(key)
-                        known["seen"] += 1
-                log(f"{prefix}: объявлений — {len(parsed['ads'])}", "green")
-
-            if seen_now:
-                info["runs_with_ads"] += 1
-                if info["status"] == "no_ads":
-                    info["status"] = "ok"
-
-    order = {query: index for index, query in enumerate(queries)}
-    ads = sorted(merged.values(), key=lambda ad: (order[ad["query"]], ad["position"]))
-    for info in summary.values():
-        info["ads"] = sum(1 for ad in ads if ad["query"] == info["query"])
-        if info["status"] == "no_ads":
-            info["message"] = STATUS_MESSAGES["no_ads"]
-    return ads, list(summary.values())
+            if stop:
+                break
+    except KeyboardInterrupt:
+        stop = "interrupted"
+        log("\nОстановлено по Ctrl+C — сохраняю собранное.", "yellow")
+    return (*_snapshot(merged, summary, queries, stop), stop)
 
 
 # ---------- Сохранение ----------
@@ -363,6 +514,12 @@ def collect(session, queries, pages=1, region=225, delay=1.0, runs=1, save_html=
 def _cell(value):
     """Список (быстрые ссылки) в одну ячейку таблицы."""
     return " | ".join(value) if isinstance(value, list) else value
+
+
+def _xlsx_cell(value):
+    # Excel не принимает управляющие символы: openpyxl на них падает при записи
+    value = _cell(value)
+    return ILLEGAL_CHARACTERS_RE.sub("", value) if isinstance(value, str) else value
 
 
 def _write_json(target, ads, summary, region, runs):
@@ -391,7 +548,7 @@ def _write_xlsx(path, ads, summary):
         sheet.title = title
         sheet.append(list(columns.values()))
         for row in rows:
-            sheet.append([_cell(row[key]) for key in columns])
+            sheet.append([_xlsx_cell(row[key]) for key in columns])
         for cell, width in zip(sheet[1], widths):
             cell.font = Font(bold=True)
             sheet.column_dimensions[cell.column_letter].width = width
@@ -444,33 +601,128 @@ def _duration(seconds):
     return f"{round(seconds)} с" if seconds < 90 else f"{round(seconds / 60)} мин"
 
 
-def run(queries, region=225, pages=1, runs=1, output=None, delay=1.0, proxy=None,
-        save_html=None):
-    """Собирает объявления, сохраняет результат, пишет итог. Возвращает код выхода."""
-    output = output or default_output()
-    requests_count = len(queries) * pages * runs
-    log(f"Запросов к Яндексу: до {requests_count}, это около "
-        f"{_duration(requests_count * (delay + SECONDS_PER_REQUEST))}.", "dim")
-    ads, summary = collect(make_session(proxy), queries, pages=pages, region=region,
-                           delay=delay, runs=runs, save_html=save_html)
-    try:
-        write_output(output, ads, summary, region, runs)
-    except OSError as exc:
-        log(f"Не удалось сохранить результат: {exc}", "red")
+def estimate(query_count, pages, runs, delay=1.0):
+    """(сколько максимум обращений к Яндексу, сколько примерно секунд)."""
+    count = query_count * pages * runs
+    return count, count * (delay + SECONDS_PER_REQUEST)
+
+
+class _Saver:
+    """Сохраняет результат по ходу сбора и в конце. Если файл записать не удалось
+    (открыт в Excel, нет места, что угодно ещё), кладёт в results запасной JSON:
+    собранное не должно пропасть из-за сохранения."""
+
+    def __init__(self, output, region, runs):
+        self.output, self.region, self.runs = output, region, runs
+        self.warned = self.backup_used = False
+
+    def checkpoint(self, ads, summary):
+        try:
+            write_output(self.output, ads, summary, self.region, self.runs)
+        except Exception as exc:  # сохранение по ходу не должно ронять сбор
+            if not self.warned:
+                log(f"Не получается сохранить {self.output} по ходу сбора ({exc}). "
+                    "Попробую ещё раз в конце.", "yellow")
+                self.warned = True
+
+    def final(self, ads, summary):
+        """Возвращает, куда сохранено: путь, 'stdout' или None."""
+        try:
+            write_output(self.output, ads, summary, self.region, self.runs)
+            return "stdout" if self.output == "-" else str(Path(self.output).resolve())
+        except Exception as exc:  # любая ошибка записи — не повод терять собранное
+            log(f"Не удалось сохранить {self.output}: {exc}", "red")
+        backup = RESULTS_DIR / time.strftime("backup_%Y-%m-%d_%H-%M-%S.json")
+        try:
+            RESULTS_DIR.mkdir(exist_ok=True)
+            with open(backup, "w", encoding="utf-8") as f:
+                _write_json(f, ads, summary, self.region, self.runs)
+        except OSError as exc:
+            log(f"Запасной файл тоже не записался: {exc}", "red")
+            return None
+        log(f"Собранное сохранено в запасной файл: {backup}", "yellow")
+        self.backup_used = True
+        return str(backup)
+
+
+# Что делать дальше: (совет для режима с параметрами, совет человеку)
+HINTS = {
+    "captcha": ("Подождите и повторите; помогут --delay побольше или другой IP (--proxy).",
+                "Подождите 15–30 минут и запустите снова, лучше с меньшим числом прогонов."),
+    "network": ("Проверьте сеть, VPN или --proxy.",
+                "Проверьте интернет или VPN и запустите снова."),
+    "unexpected": ("Незнакомые страницы сохранены в results/debug — по ним надо обновить "
+                   "parse_page().",
+                   "Незнакомые страницы сохранены в папке results/debug — отправьте их "
+                   "разработчику."),
+    "no_ads": ("Объявления сильно зависят от региона — попробуйте другой (-r).",
+               "Объявления сильно зависят от города — попробуйте другой."),
+}
+
+
+def _report(query_count, ads, summary, stop, saved_to, human, backup=False):
+    """Итог зависит от исхода: зелёный — всё собрано, жёлтый — частично или пусто,
+    красный — не получилось. Возвращает код выхода."""
+    def hint(kind):
+        log(HINTS[kind][1 if human else 0], "yellow")
+
+    where = f" → {saved_to}" if saved_to else " (сохранить не удалось)"
+    found = f"объявлений — {len(ads)}"
+    problems = [info for info in summary if info["status"] in ERROR_STATUSES]
+
+    if stop == "interrupted":
+        log(f"Остановлено по Ctrl+C: {found}{where}", "bold", "yellow")
+        return EXIT_INTERRUPTED
+    if stop:
+        log(f"Собрано не всё: {STOP_MESSAGES[stop]}. {found.capitalize()}{where}", "bold", "red")
+        hint(stop)
         return EXIT_ERRORS
-
-    where = "stdout" if output == "-" else Path(output).resolve()
-    log(f"Готово: запросов {len(queries)}, объявлений {len(ads)} → {where}", "bold", "green")
-
-    if any(info["status"] in ERROR_STATUSES for info in summary):
+    if problems:
+        head, style = ("Собрано частично", "yellow") if ads else ("Не получилось", "red")
+        log(f"{head}: {found}, запросов с проблемами — {len(problems)} из {query_count}{where}",
+            "bold", style)
+        if any(info["status"] == "unexpected" for info in problems):
+            hint("unexpected")
         return EXIT_ERRORS
     if not ads:
-        log("Объявлений нет. Они сильно зависят от региона — попробуйте другой регион.", "yellow")
+        log(f"Объявлений нет: Яндекс по всем запросам ответил «ничего не нашлось»{where}",
+            "bold", "yellow")
+        hint("no_ads")
         return EXIT_NO_ADS
+    if not saved_to or backup:
+        place = "сохранено в запасной файл" if saved_to else "не сохранено"
+        log(f"Собрано, но {place}: {found}{where}", "bold", "yellow")
+        return EXIT_ERRORS
+    log(f"Готово: {found}, запросов — {query_count}{where}", "bold", "green")
     return EXIT_OK
 
 
-# ---------- Пошаговый режим (python main.py без аргументов) ----------
+def run(queries, region=225, pages=1, runs=1, output=None, delay=1.0, proxy=None,
+        save_html=None, human=False):
+    """Собирает объявления, сохраняет результат (по ходу и в конце), пишет итог.
+    human — человеку советы без флагов командной строки. Возвращает код выхода."""
+    output = output or default_output()
+    count, seconds = estimate(len(queries), pages, runs, delay)
+    log(f"Обращений к Яндексу: до {count}, это около {_duration(seconds)}.", "dim")
+    saver = _Saver(output, region, runs)
+    ads, summary, stop = collect(make_session(proxy), queries, pages=pages, region=region,
+                                 delay=delay, runs=runs, save_html=save_html,
+                                 on_progress=None if output == "-" else saver.checkpoint)
+    saved_to = saver.final(ads, summary)
+    return _report(len(queries), ads, summary, stop, saved_to, human, saver.backup_used)
+
+
+# ---------- Ручной режим (python main.py без аргументов) ----------
+
+# Значения по умолчанию в карточке перед стартом
+INTERACTIVE_RUNS = 1
+INTERACTIVE_PAGES = 1
+MAX_PAGES = 10  # дальше 2–3 страниц реклама почти никогда не идёт
+DEFAULT_REGION = 225  # Enter в вопросе о городе — вся Россия
+
+# Ввод, похожий на путь к файлу, а не на поисковый запрос
+_FILE_SUFFIXES = (".txt", ".csv", ".tsv", ".xlsx", ".xlsm", ".xls", ".docx")
+
 
 def _clean_path(value):
     """Путь, перетащенный в окно терминала: Windows берёт его в кавычки,
@@ -481,117 +733,299 @@ def _clean_path(value):
     return value
 
 
-def _prompt(label, default):
-    return f"{paint(label, 'bold', stream=sys.stdout)} {paint(f'[{default}]', 'dim', stream=sys.stdout)}: "
+def _looks_like_path(text):
+    text = text.strip().strip("\"'")
+    return (text.startswith(("/", "~", "./", "../", ".\\", "..\\"))
+            or re.match(r"[A-Za-z]:[\\/]", text) is not None
+            or text.lower().endswith(_FILE_SUFFIXES))
+
+
+def _find_file(text):
+    """Файл из ввода; если по этому пути его нет — ищем такое же имя рядом с программой."""
+    path = Path(_clean_path(text)).expanduser()
+    if path.exists():
+        return path
+    nearby = RESULTS_DIR.parent / path.name
+    return nearby if nearby.exists() else None
+
+
+def _first_number(value):
+    match = re.search(r"\d+", value)
+    return int(match.group()) if match else None
 
 
 def _ask_until(ask, prompt, convert):
     """Переспрашивает, пока convert не примет ответ (ValueError — показать и спросить снова)."""
     while True:
         try:
-            return convert(ask(prompt).strip())
+            return convert(clean_text(ask(prompt)))
         except ValueError as exc:
             say(f"  {exc}", "yellow")
 
 
-def _parse_number(value, default, maximum=None):
+def _confirm(ask, question):
+    """Да/нет цифрой: «н» в русской раскладке стоит на клавише «y», буквы путают."""
+    while True:
+        answer = clean_text(ask(f"{question} Enter — да, 0 — нет: "))
+        if answer in ("", "0"):
+            return answer == ""
+        say("  Нажмите Enter, чтобы согласиться, или 0, чтобы отказаться.", "yellow")
+
+
+def _load_queries_file(path):
+    """Запросы из файла или None, если файл не подошёл (причина уже показана)."""
+    if path.is_dir():
+        say(f"  «{path.name}» — это папка, а нужен файл со списком запросов.", "yellow")
+        return None
+    try:
+        queries = read_queries([], str(path))
+    except (OSError, UnicodeError, ValueError) as exc:
+        say(f"  Не получилось прочитать файл: {exc}", "yellow")
+        return None
+    if not queries:
+        say(f"  В файле «{path.name}» нет запросов.", "yellow")
+        return None
+    say(f"  Из файла «{path.name}» взято запросов: {len(queries)}.", "green")
+    return queries
+
+
+def _ask_queries(ask):
+    say("Введите поисковые запросы по одному на строку или перетащите в это окно файл "
+        "со списком (.txt). Когда закончите, нажмите Enter на пустой строке.", "dim")
+    queries = []
+    while True:
+        # Вставка из буфера через readline может прийти сразу несколькими строками
+        lines = [clean_text(line) for line in ask(f"{len(queries) + 1}> ").splitlines()]
+        lines = [line for line in lines if line]
+        if not lines:
+            if not queries:
+                say("  Нужен хотя бы один запрос.", "yellow")
+                continue
+            say(f"  Запросов: {len(queries)} — {'; '.join(queries[:5])}"
+                f"{'; …' if len(queries) > 5 else ''}", "green")
+            more = ask("  Enter — дальше, или допишите ещё: ")
+            lines = [line for line in (clean_text(x) for x in more.splitlines()) if line]
+            if not lines:
+                break
+        for line in lines:
+            if _looks_like_path(line):
+                path = _find_file(line)
+                if path is None:
+                    say(f"  Файл не найден: {_clean_path(line)}", "yellow")
+                    continue
+                queries += _load_queries_file(path) or []
+            else:
+                queries.append(line)
+        queries = list(dict.fromkeys(queries))
+
+    if any("," in query for query in queries) and _confirm(
+            ask, "  Похоже, в некоторых строках несколько запросов через запятую. Разделить их?"):
+        queries = list(dict.fromkeys(
+            part.strip() for query in queries for part in query.split(",") if part.strip()))
+        say(f"  Теперь запросов: {len(queries)}.", "green")
+    return queries
+
+
+def _region_label(code):
+    name = _REGION_NAMES.get(code)
+    return f"{name} ({code})" if name else f"код {code}"
+
+
+def _similar_regions(value):
+    """Похожие города: «Ставропольский край» → Ставрополь, «Краснадар» → Краснодар."""
+    norm = _norm(value)
+    first = norm.split()[0] if norm else ""
+    by_norm = {_norm(name): name for name in REGIONS}
+    found = [name for key, name in by_norm.items()
+             if len(first) >= 4 and (first.startswith(key) or key.startswith(first))]
+    found += [by_norm[key] for key in difflib.get_close_matches(norm, list(by_norm), n=3,
+                                                                  cutoff=0.75)]
+    return list(dict.fromkeys(found))[:3]
+
+
+def _show_regions():
+    say(" · ".join(f"{name} {code}" for name, code in sorted(REGIONS.items())), "dim")
+    say(f"Остальные регионы — по коду из справочника Яндекса: {REGIONS_DOC}", "dim")
+
+
+def _ask_region(ask, current=None):
+    say("Реклама сильно зависит от города. Введите город или код региона Яндекса; "
+        "? — список городов.", "dim")
+    default = current or DEFAULT_REGION
+    while True:
+        value = clean_text(ask(f"Город [{_region_label(default)}]: "))
+        if value == "?":
+            _show_regions()
+            continue
+        if not value:
+            return default
+        number = _first_number(value)
+        if number:  # «36», «36 Ставрополь»
+            if number in _REGION_NAMES or _confirm(
+                    ask, f"  Кода {number} нет среди известных городов. Всё равно взять его?"):
+                return number
+            continue
+        try:
+            return parse_region(value)
+        except ValueError:
+            pass
+        similar = _similar_regions(value)
+        if len(similar) == 1 and _confirm(
+                ask, f"  Такого в списке нет. Может быть, {_region_label(REGIONS[similar[0]])}?"):
+            return REGIONS[similar[0]]
+        if len(similar) > 1:
+            say("  Такого в списке нет. Похожие: "
+                + ", ".join(_region_label(REGIONS[name]) for name in similar) + ".", "yellow")
+        elif not similar:
+            say("  Такого города в списке нет. ? — список городов; остальные регионы — "
+                f"по коду из справочника: {REGIONS_DOC}", "yellow")
+
+
+def _parse_count(value, default, maximum):
+    """Число из ответа: «3», «3 прогона», «3–5» (берётся первое)."""
     if not value:
         return default
-    if not value.isdigit() or int(value) < 1 or (maximum and int(value) > maximum):
-        raise ValueError(f"Нужно целое число от 1{f' до {maximum}' if maximum else ''}.")
-    return int(value)
+    number = _first_number(value)
+    if number is None:
+        raise ValueError("Введите число, например 3.")
+    if not 1 <= number <= maximum:
+        raise ValueError(f"Нужно число от 1 до {maximum}.")
+    return number
+
+
+def _ask_completeness(ask, runs, pages):
+    say("Прогоны — повторные сборы: Яндекс каждый раз показывает немного разный набор "
+        "объявлений, и несколько прогонов дают более полный список. Обычно хватает трёх.", "dim")
+    runs = _ask_until(ask, f"Прогонов, от 1 до {MAX_RUNS} [{runs}]: ",
+                      lambda v: _parse_count(v, runs, MAX_RUNS))
+    say("Страницы — сколько страниц объявлений брать по каждому запросу, на странице до 10. "
+        "Обычно хватает 1–2: когда реклама кончится, программа остановится сама.", "dim")
+    pages = _ask_until(ask, f"Страниц, от 1 до {MAX_PAGES} [{pages}]: ",
+                       lambda v: _parse_count(v, pages, MAX_PAGES))
+    return runs, pages
+
+
+def _free_name(path):
+    """«отчёт.xlsx» занят — «отчёт (2).xlsx»: прошлый результат не затираем."""
+    number = 2
+    candidate = path
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem} ({number}){path.suffix}")
+        number += 1
+    return candidate
 
 
 def _parse_output(value, default):
-    """Пустой ответ — файл по умолчанию; просто имя — в папку results; путь — как указан."""
+    """Пусто — файл по умолчанию; имя — в папку results; папка — внутрь неё; путь — как есть."""
     value = _clean_path(value)
     if not value:
         path = Path(default)
+    elif Path(value).expanduser().is_dir():
+        path = Path(value).expanduser() / Path(default).name
     elif any(sep and sep in value for sep in (os.sep, os.altsep)):
-        path = Path(value)
+        path = Path(value).expanduser()
     else:
         path = RESULTS_DIR / value
     if not path.suffix:
         path = path.with_name(path.name + ".xlsx")
+    if path.suffix.lower() not in OUTPUT_FORMATS:
+        raise ValueError("Поддерживаются .xlsx (Excel), .csv и .json. "
+                         "Не знаете, что выбрать, — оставьте Excel.")
+    if path.exists():
+        free = _free_name(path)
+        say(f"  «{path.name}» уже есть — сохраню как «{free.name}», прошлый файл не трону.",
+            "yellow")
+        path = free
     problem = _prepare_output(str(path))
     if problem:
         raise ValueError(problem)
     return str(path)
 
 
-def _ask_queries(ask):
-    say("Запросы — по одному на строку, в конце пустая строка.", "bold")
-    say("Если запросов много, укажите путь к текстовому файлу с ними "
-        "(можно перетащить файл в это окно).", "dim")
-    while True:
-        first = ask("").strip()
-        if not first:
-            say("  Нужен хотя бы один запрос.", "yellow")
-            continue
-        path = Path(_clean_path(first))
-        if path.is_file():
-            try:
-                queries = read_queries([], str(path))
-            except OSError as exc:
-                say(f"  Не удалось прочитать файл: {exc}", "yellow")
-                continue
-            if not queries:
-                say("  В файле нет запросов.", "yellow")
-                continue
-            say(f"  Из файла взято запросов: {len(queries)}.", "green")
-            return queries
-        lines = [first]
-        while line := ask("").strip():
-            lines.append(line)
-        queries = read_queries(lines)
-        say(f"  Запросов: {len(queries)}.", "green")
-        return queries
+def _shown(path):
+    """Путь покороче: внутри папки программы — относительный."""
+    try:
+        return str(Path(path).resolve().relative_to(RESULTS_DIR.parent))
+    except ValueError:
+        return str(path)
+
+
+def _ask_output(ask, current):
+    say("Просто имя файла — сохраню в папку results. Полный путь или папка — сохраню туда.",
+        "dim")
+    return _ask_until(ask, f"Файл [{_shown(current)}]: ", lambda v: _parse_output(v, current))
+
+
+def _open_file(path):
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # noqa — есть только на Windows
+        else:
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.run([opener, path], check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        say(f"  Открыть не получилось. Файл лежит здесь: {path}", "yellow")
+
+
+def _card(queries, region, runs, pages, output):
+    count, seconds = estimate(len(queries), pages, runs)
+    preview = ", ".join(queries[:3]) + (", …" if len(queries) > 3 else "")
+    say("\nПроверьте перед стартом:", "bold")
+    say(f"  1. Запросы: {len(queries)} ({preview})")
+    say(f"  2. Город: {_region_label(region)}")
+    say(f"  3. Полнота: прогонов — {runs}, страниц на запрос — {pages}")
+    say(f"  4. Файл: {_shown(output)}")
+    say(f"  Сбор займёт около {_duration(seconds)}, обращений к Яндексу — до {count}.", "dim")
 
 
 def interactive(ask=input):
-    """Пошаговый режим для человека: вопросы вместо флагов."""
-    say("Сбор объявлений Яндекс.Директа", "bold", "cyan")
-    say("В квадратных скобках — значение по умолчанию, для него просто нажмите Enter. "
-        "Выход — Ctrl+C.\n", "dim")
+    """Ручной режим: два вопроса (запросы и город), потом карточка — проверить и при
+    необходимости поменять любой пункт, не начиная заново."""
     try:
+        import readline  # noqa: F401 — стрелки и правка строки при вводе (macOS, Linux)
+    except ImportError:
+        pass  # на Windows строку правит сама консоль
+    say("Сбор рекламы Яндекс.Директа", "bold", "cyan")
+    say("Программа соберёт объявления конкурентов по вашим запросам и сохранит таблицу Excel "
+        "в папку results. Выход — Ctrl+C.\n", "dim")
+    try:
+        say("Шаг 1 из 2. Запросы", "bold")
         queries = _ask_queries(ask)
-
-        say()
-        say("Регион — код или название города. Популярные: 225 Россия, 213 Москва, "
-            "1 Москва и область, 2 Санкт-Петербург, 54 Екатеринбург, 43 Казань, "
-            "35 Краснодар, 36 Ставрополь.", "dim")
-        say(f"Все коды регионов: {REGIONS_DOC}", "dim")
-        region = _ask_until(ask, _prompt("Регион", "225 — Россия"),
-                            lambda v: parse_region(v or "225"))
-        name = _REGION_NAMES.get(region)
-        if name:
-            say(f"  Регион: {name} ({region}).", "green")
-        else:
-            say(f"  Регион: код {region} — его нет среди популярных, сверьтесь со справочником.",
-                "yellow")
-
-        say()
-        pages = _ask_until(ask, _prompt("Сколько страниц объявлений на запрос (на странице до 10)", 1),
-                           lambda v: _parse_number(v, 1))
-
-        say()
-        say("Прогоны — повторные сборы: Яндекс каждый раз показывает немного разный набор "
-            f"объявлений, и несколько прогонов дают более полный список. Обычно хватает 3–5, "
-            f"максимум {MAX_RUNS}.", "dim")
-        runs = _ask_until(ask, _prompt("Сколько прогонов", 1),
-                          lambda v: _parse_number(v, 1, MAX_RUNS))
-
-        say()
-        default = default_output()
-        shown = Path(default).relative_to(RESULTS_DIR.parent)
-        say("Просто имя файла — сохраню в папку results, полный путь — куда укажете.", "dim")
-        output = _ask_until(ask, _prompt("Куда сохранить (.xlsx, .csv или .json)", shown),
-                            lambda v: _parse_output(v, default))
+        say("\nШаг 2 из 2. Город", "bold")
+        region = _ask_region(ask)
+        runs, pages = INTERACTIVE_RUNS, INTERACTIVE_PAGES
+        output = _parse_output("", default_output())
+        while True:
+            _card(queries, region, runs, pages, output)
+            choice = clean_text(ask("Enter — начать, 1–4 — изменить пункт, 0 — выйти: "))
+            if not choice:
+                break
+            if choice == "0":
+                say("Отменено.", "yellow")
+                return EXIT_USAGE
+            if choice == "1":
+                queries = _ask_queries(ask)
+            elif choice == "2":
+                region = _ask_region(ask, region)
+            elif choice == "3":
+                runs, pages = _ask_completeness(ask, runs, pages)
+            elif choice == "4":
+                output = _ask_output(ask, output)
+            else:
+                say("  Нажмите Enter, чтобы начать, или цифру от 1 до 4.", "yellow")
     except EOFError:
         say("\nОтменено.", "yellow")
         return EXIT_USAGE
     say()
-    return run(queries, region=region, pages=pages, runs=runs, output=output)
+    code = run(queries, region=region, pages=pages, runs=runs, output=output, human=True)
+    if Path(output).exists():
+        try:
+            if _confirm(ask, "\nОткрыть таблицу?"):
+                _open_file(output)
+        except EOFError:
+            pass
+    return code
 
 
 # ---------- Режим с аргументами (для скриптов и агентов) ----------
@@ -607,10 +1041,10 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Собирает объявления Яндекс.Директа по поисковым запросам "
                     "(страница yandex.ru/search/ads). Без аргументов в терминале — "
-                    "пошаговый режим с вопросами.",
+                    "ручной режим с вопросами.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""примеры:
-  python main.py                              пошаговый режим
+  python main.py                              ручной режим
   python main.py "купить духи" "парфюм магазин"
   python main.py -f queries.txt -p 2 -r Москва --runs 3 -o ads.xlsx
   python main.py -f queries.txt -r 36 -o -    JSON в stdout (удобно агенту)
@@ -668,11 +1102,11 @@ def main(argv=None):
 
     try:
         queries = read_queries(args.queries, args.file)
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         parser.error(f"не удалось прочитать файл запросов: {exc}")
     if not queries:
         parser.error("не задано ни одного запроса: передайте их аргументами или через -f FILE "
-                     "(без аргументов в терминале запускается пошаговый режим)")
+                     "(без аргументов в терминале запускается ручной режим)")
     if args.pages < 1:
         parser.error("--pages должно быть не меньше 1")
     if not 1 <= args.runs <= MAX_RUNS:

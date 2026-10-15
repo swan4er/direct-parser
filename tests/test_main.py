@@ -292,12 +292,17 @@ def test_cli_checks_output_before_requests(monkeypatch, tmp_path):
     locked = tmp_path / "locked.xlsx"
     locked.write_bytes(b"")
     locked.chmod(0o444)
+    readonly = tmp_path / "только-чтение"
+    readonly.mkdir()
+    readonly.chmod(0o555)
     session = use_session(monkeypatch, FakeSession([ADS_PAGE]))
-    for output in (str(locked), str(tmp_path / "нет-папки" / "out.xlsx")):
+    for output in (str(locked), str(tmp_path / "нет-папки" / "out.xlsx"),
+                   str(readonly / "out.xlsx"), "имя\x00с-нулём.xlsx"):
         with pytest.raises(SystemExit) as exc:
             main.main(["купить духи", "-o", output])
         assert exc.value.code == main.EXIT_USAGE
     assert session.calls == []
+    assert not any(readonly.iterdir())  # пробный файл не остаётся
 
 
 # ---------- прогоны ----------

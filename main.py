@@ -592,7 +592,13 @@ def _prepare_output(output):
                 pass
         elif not path.parent.is_dir():
             raise FileNotFoundError(f"нет папки {path.parent}")
-    except OSError as exc:
+        else:
+            # Пробный файл: сразу видно, примет ли система имя (в Windows нельзя
+            # : ? * < > |) и можно ли писать в папку
+            with open(path, "xb"):
+                pass
+            path.unlink()
+    except (OSError, ValueError) as exc:
         return f"Не получается записать {output} ({exc}). Если файл открыт в Excel — закройте его."
     return None
 

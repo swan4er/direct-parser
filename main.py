@@ -381,9 +381,22 @@ def parse_page(html, final_url=""):
     return {"status": status, "ads": ads}
 
 
+class _NewVisitorSession(requests.Session):
+    """Каждое обращение — как новый посетитель: куки прошлых обращений стираются,
+    соединение не переиспользуется (Connection: close). Замер 15.10.2026: с куками
+    и одним соединением Яндекс через десяток обращений молча перестаёт показывать
+    рекламу (67–76 % ответов с объявлениями, пустые серии растут); так — 85 %,
+    длинных пустых серий нет."""
+
+    def request(self, *args, **kwargs):
+        self.cookies.clear()
+        return super().request(*args, **kwargs)
+
+
 def make_session(proxy=None):
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9"})
+    session = _NewVisitorSession()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9",
+                            "Connection": "close"})
     # Перегрузка Яндекса (429, 5xx) проходит сама — до трёх повторов с паузой. Обрыв связи
     # повторять почти бесполезно — один повтор, иначе каждое обращение ждёт секунды
     retry = Retry(total=3, connect=1, backoff_factor=1,
@@ -468,37 +481,45 @@ def collect(session, queries, pages=1, region=225, delay=1.0, runs=1, save_html=
                 seen_now = set()
                 position = 0
                 for page in range(pages):
-                    if not first_request and delay:
-                        time.sleep(delay)
-                    first_request = False
                     prefix = f"[{number}/{len(queries)}] «{query}», стр. {page + 1}"
                     if runs > 1:
                         prefix = f"[прогон {run_number}/{runs}] {prefix}"
-                    try:
-                        response = session.get(
-                            BASE_URL, params={"text": query, "p": page, "lr": region}, timeout=TIMEOUT
-                        )
-                        response.raise_for_status()
-                    except requests.RequestException as exc:
-                        reason = _network_reason(exc)
-                        _problem(info, "error", f"{reason} ({type(exc).__name__}).")
-                        log(f"{prefix}: {reason}.", "red")
-                        network_errors += 1
-                        if network_errors >= MAX_NETWORK_ERRORS:
-                            stop = "network"
+                    # Пустую первую страницу перепроверяем один раз: замер 15.10.2026 —
+                    # около 15 % ответов Яндекса были ложным «ничего не нашлось»
+                    for attempt in (1, 2):
+                        if not first_request and delay:
+                            time.sleep(delay)
+                        first_request = False
+                        try:
+                            response = session.get(
+                                BASE_URL, params={"text": query, "p": page, "lr": region},
+                                timeout=TIMEOUT)
+                            response.raise_for_status()
+                        except requests.RequestException as exc:
+                            reason = _network_reason(exc)
+                            _problem(info, "error", f"{reason} ({type(exc).__name__}).")
+                            log(f"{prefix}: {reason}.", "red")
+                            network_errors += 1
+                            if network_errors >= MAX_NETWORK_ERRORS:
+                                stop = "network"
+                            response = None
+                            break
+                        network_errors = 0
+                        if info["status"] == "skipped":
+                            info["status"] = "no_ads"
+
+                        if save_html:
+                            run_suffix = f"_r{run_number}" if runs > 1 else ""
+                            path = Path(save_html) / (
+                                f"{number:03d}_{_safe_name(query)}_p{page + 1}{run_suffix}.html")
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_text(response.text, encoding="utf-8")
+
+                        parsed = parse_page(response.text, response.url)
+                        if not (page == 0 and attempt == 1 and parsed["status"] == "no_ads"):
+                            break
+                    if response is None:
                         break
-                    network_errors = 0
-                    if info["status"] == "skipped":
-                        info["status"] = "no_ads"
-
-                    if save_html:
-                        run_suffix = f"_r{run_number}" if runs > 1 else ""
-                        path = Path(save_html) / (
-                            f"{number:03d}_{_safe_name(query)}_p{page + 1}{run_suffix}.html")
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text(response.text, encoding="utf-8")
-
-                    parsed = parse_page(response.text, response.url)
                     info["pages"] = max(info["pages"], page + 1)
 
                     if not parsed["ads"]:
@@ -651,7 +672,8 @@ def _duration(seconds):
 
 
 def estimate(query_count, pages, runs, delay=1.0):
-    """(сколько максимум обращений к Яндексу, сколько примерно секунд)."""
+    """(сколько примерно обращений к Яндексу, сколько примерно секунд). Пустые первые
+    страницы перепроверяются, поэтому по пустым запросам обращений чуть больше."""
     count = query_count * pages * runs
     return count, count * (delay + SECONDS_PER_REQUEST)
 
@@ -756,7 +778,7 @@ def run(queries, region=225, pages=1, runs=1, output=None, delay=1.0, proxy=None
     human — человеку советы без флагов командной строки. Возвращает код выхода."""
     output = output or default_output()
     count, seconds = estimate(len(queries), pages, runs, delay)
-    log(f"Обращений к Яндексу: до {count}, это около {_duration(seconds)}.", "dim")
+    log(f"Обращений к Яндексу: около {count}, это около {_duration(seconds)}.", "dim")
     saver = _Saver(output, region, runs)
     ads, summary, stop = collect(make_session(proxy), queries, pages=pages, region=region,
                                  delay=delay, runs=runs, save_html=save_html,
@@ -1048,7 +1070,7 @@ def _card(queries, region, runs, pages, output):
     say(f"  2. Город: {_region_label(region)}")
     say(f"  3. Полнота: прогонов — {runs}, страниц на запрос — {pages}")
     say(f"  4. Файл: {_shown(output)}")
-    say(f"  Сбор займёт около {_duration(seconds)}, обращений к Яндексу — до {count}.", "dim")
+    say(f"  Сбор займёт около {_duration(seconds)}, обращений к Яндексу — около {count}.", "dim")
 
 
 def interactive(ask=input, pasted_waiting=_pasted_text_waiting):
@@ -1133,18 +1155,25 @@ def build_parser():
 
 прогоны (--runs): Яндекс каждый раз показывает немного разный набор объявлений.
 Прогоны объединяются: одинаковые объявления склеиваются, в колонке «Встречалось
-в прогонах» видно, как часто объявление показывалось. Обычно хватает 3–5.
+в прогонах» видно, как часто объявление показывалось. Обычно хватает трёх.
+
+как идут обращения: каждое — как новый посетитель (без кук, новое соединение);
+пустая первая страница перепроверяется один раз — Яндекс иногда ошибочно отвечает
+«ничего не нашлось». На первой капче и после трёх ошибок связи подряд сбор
+останавливается, собранное сохраняется; файл из -o переписывается после каждого запроса.
 
 статусы запросов: ok — объявления есть; no_ads — Яндекс ответил «ничего не нашлось»;
-captcha — капча; unexpected — незнакомая страница (вёрстка поменялась?);
-error — ошибка сети.
+captcha — капча; unexpected — незнакомая страница (вёрстка поменялась? страница
+сохранена в results/debug, путь — в message); error — ошибка связи;
+skipped — до запроса не дошли, сбор остановлен раньше.
 
 коды выхода:
   0 — собрано хотя бы одно объявление
-  1 — капча, ошибка сети или незнакомая вёрстка хотя бы по одному запросу
+  1 — капча, ошибка связи, незнакомая вёрстка или необработанные запросы
       (собранное всё равно сохраняется)
   2 — неверные аргументы или результат некуда сохранить
   3 — ошибок нет, но объявлений ноль
+  130 — остановлено по Ctrl+C (собранное сохранено)
 
 цвет в терминале выключается переменной окружения NO_COLOR=1.""",
     )

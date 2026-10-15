@@ -321,7 +321,7 @@ def test_cli_captcha_exit_code(monkeypatch, tmp_path):
 def test_cli_logs_request_estimate(monkeypatch, tmp_path, capsys):
     run_cli(monkeypatch, FakeSession([]), "а", "б", "-p", "3", "--runs", "2",
             "-o", str(tmp_path / "out.json"))
-    assert "Обращений к Яндексу: до 12" in capsys.readouterr().err
+    assert "Обращений к Яндексу: около 12" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("argv", [
@@ -504,6 +504,36 @@ def test_human_hints_have_no_command_line_flags(monkeypatch, tmp_path, capsys, n
     assert "Подождите 15–30 минут" in err and "--" not in err
 
 
+def test_session_forgets_cookies_and_connections(monkeypatch):
+    # Каждое обращение — как новый посетитель: иначе Яндекс молча прячет рекламу
+    session = main.make_session()
+    assert session.headers["Connection"] == "close"
+    session.cookies.set("yandexuid", "123")
+    seen = []
+    monkeypatch.setattr(requests.Session, "request",
+                        lambda self, *args, **kwargs: seen.append(dict(self.cookies)))
+    session.get("https://yandex.ru/search/ads")
+    assert seen == [{}]
+
+
+def test_empty_first_page_is_rechecked_once(monkeypatch, tmp_path):
+    out = tmp_path / "out.json"
+    session = QueueSession(NO_ADS_PAGE, ads_html("a.ru"))  # ложное «ничего не нашлось»
+    assert run_cli(monkeypatch, session, "окна", "-o", str(out)) == main.EXIT_OK
+    assert len(session.calls) == 2
+    assert [ad["domain"] for ad in read_json(out)["ads"]] == ["a.ru"]
+
+    session = FakeSession([])  # пусто и при перепроверке — значит, правда пусто
+    assert run_cli(monkeypatch, session, "окна", "-o", str(out)) == main.EXIT_NO_ADS
+    assert [call["p"] for call in session.calls] == [0, 0]
+
+
+def test_later_empty_pages_are_not_rechecked(monkeypatch, tmp_path):
+    session = FakeSession([ads_html("a.ru")])
+    run_cli(monkeypatch, session, "окна", "-p", "3", "-o", str(tmp_path / "out.json"))
+    assert [call["p"] for call in session.calls] == [0, 1]  # стр. 2 пуста — реклама кончилась
+
+
 # ---------- цвет ----------
 
 def test_paint_colors_only_real_terminals(monkeypatch):
@@ -581,7 +611,7 @@ def test_interactive_two_questions_and_start(monkeypatch, capsys):
     assert "1. Запросы: 2 (купить духи, парфюм магазин)" in printed
     assert "2. Город: Ставрополь (36)" in printed
     assert "3. Полнота: прогонов — 3, страниц на запрос — 1" in printed
-    assert "обращений к Яндексу — до 6" in printed
+    assert "обращений к Яндексу — около 6" in printed
     assert len(list(main.RESULTS_DIR.glob("ads_*.xlsx"))) == 1
     assert opened == []  # на «Открыть таблицу?» ответа не было (EOF) — не открываем
 

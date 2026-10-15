@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# результаты сбора
+ads_results.*
+*.xlsx
+*.csv
+docs/CHECKPOINT.md

@@ -2,14 +2,16 @@
 """Сбор рекламных объявлений Яндекс.Директа со страницы yandex.ru/search/ads.
 
 Без аргументов в терминале — пошаговый режим: программа сама спрашивает запросы,
-регион, число страниц и файл. С аргументами — режим для скриптов и агентов
-(python main.py --help). Ход работы пишется в stderr, данные — в файл или в stdout.
+регион, число страниц и прогонов, имя файла. С аргументами — режим для скриптов
+и агентов (python main.py --help). Ход работы пишется в stderr, данные — в файл
+(по умолчанию в папку results) или в stdout.
 """
 
 import argparse
 import codecs
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -58,6 +60,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
 REGIONS_DOC = "https://aistudio.yandex.ru/docs/ru/search-api/reference/regions"
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # Коды регионов (параметр lr) из справочника REGIONS_DOC: страны и крупные города.
 # Остальные регионы задаются числовым кодом.
@@ -83,7 +86,8 @@ REGION_ALIASES = {"мск": 213, "москва и область": 1, "спб": 
 AD_COLUMNS = {
     "query": "Ключевой запрос",
     "page": "Страница",
-    "position": "Порядковый номер",
+    "position": "Лучшая позиция",
+    "seen": "Встречалось в прогонах",
     "domain": "Домен",
     "title": "Заголовок",
     "description": "Описание",
@@ -95,11 +99,18 @@ AD_COLUMNS = {
 QUERY_COLUMNS = {
     "query": "Ключевой запрос",
     "status": "Статус",
+    "runs_with_ads": "Прогонов с объявлениями",
     "pages": "Страниц загружено",
     "ads": "Объявлений",
     "message": "Пояснение",
 }
 OUTPUT_FORMATS = (".xlsx", ".csv", ".json")
+
+# Замер 15.10.2026, 10 прогонов подряд по двум запросам: новые рекламодатели приходят
+# в основном во 2–6 прогонах, после 6-го — по одному за прогон или ни одного.
+# Больше 10 прогонов почти ничего не добавляют, а нагрузка на Яндекс и риск капчи растут.
+MAX_RUNS = 10
+SECONDS_PER_REQUEST = 0.7  # средний ответ Яндекса в том же замере — 0,64 с
 
 # Коды выхода
 EXIT_OK = 0  # собрано хотя бы одно объявление, ошибок нет
@@ -116,9 +127,53 @@ STATUS_MESSAGES = {
 }
 
 
-def log(message):
-    print(message, file=sys.stderr, flush=True)
+# ---------- Цвет в терминале ----------
 
+STYLES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+_ansi = sys.platform != "win32"  # консоль Windows включается в _enable_ansi()
+
+
+def _enable_ansi():
+    """Консоль Windows понимает цветовые коды только после включения режима VT
+    (Windows 10 и новее). Не получилось — работаем без цвета."""
+    global _ansi
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        enabled = False
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # 0x0004 — ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                enabled = bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004)) or enabled
+        _ansi = enabled
+    except Exception:  # цвет — украшение: из-за него программа падать не должна
+        _ansi = False
+
+
+def paint(text, *styles, stream=None):
+    """Раскрашивает текст, только если он идёт в настоящий терминал: в файлах
+    и выводе, который перехватывает агент, цветовые коды были бы мусором.
+    NO_COLOR в окружении выключает цвет (соглашение no-color.org)."""
+    stream = stream or sys.stderr
+    if (not styles or not _ansi or os.environ.get("NO_COLOR")
+            or os.environ.get("TERM") == "dumb" or not stream.isatty()):
+        return text
+    return f"\033[{';'.join(STYLES[style] for style in styles)}m{text}\033[0m"
+
+
+def log(message, *styles):
+    print(paint(message, *styles, stream=sys.stderr), file=sys.stderr, flush=True)
+
+
+def say(message="", *styles):
+    print(paint(message, *styles, stream=sys.stdout))
+
+
+# ---------- Регионы и запросы ----------
 
 def _norm(name):
     return " ".join(name.lower().replace("ё", "е").replace("-", " ").split())
@@ -161,6 +216,8 @@ def read_queries(arg_queries, file_path=None):
     cleaned = (line.strip() for line in lines)
     return list(dict.fromkeys(q for q in cleaned if q and not q.startswith("#")))
 
+
+# ---------- Разбор страницы и сбор ----------
 
 def _text(element):
     # Яндекс ставит неразрывные пробелы («Aroma\xa0Box»); для анализа нужны обычные
@@ -212,62 +269,104 @@ def make_session(proxy=None):
     return session
 
 
-def collect(session, queries, pages=1, region=225, delay=1.0, save_html=None):
-    """Обходит запросы и страницы. Возвращает (объявления, сводка по запросам)."""
-    all_ads, summary = [], []
+def _problem(info, status, message):
+    """Ошибка важнее «ok» и «no_ads»; из нескольких ошибок запоминается первая."""
+    if info["status"] not in ERROR_STATUSES:
+        info.update(status=status, message=message)
+
+
+def collect(session, queries, pages=1, region=225, delay=1.0, runs=1, save_html=None):
+    """Обходит запросы и страницы runs раз и объединяет прогоны: Яндекс каждый раз
+    показывает немного разный набор объявлений. Одинаковые объявления (тот же домен,
+    заголовок и текст) склеиваются: считается, в скольких прогонах они встретились,
+    и остаётся лучшая позиция. Возвращает (объявления, сводка по запросам)."""
+    merged = {}
+    summary = {query: {"query": query, "status": "no_ads", "runs_with_ads": 0, "pages": 0,
+                       "ads": 0, "message": ""} for query in queries}
     first_request = True
-    for number, query in enumerate(queries, 1):
-        info = {"query": query, "status": "no_ads", "pages": 0, "ads": 0, "message": ""}
-        summary.append(info)
-        for page in range(pages):
-            if not first_request and delay:
-                time.sleep(delay)
-            first_request = False
-            prefix = f"[{number}/{len(queries)}] «{query}», стр. {page + 1}"
-            try:
-                response = session.get(
-                    BASE_URL, params={"text": query, "p": page, "lr": region}, timeout=30
-                )
-                response.raise_for_status()
-            except requests.RequestException as exc:
-                info.update(status="error", message=str(exc))
-                log(f"{prefix}: ошибка сети — {exc}")
-                break
+    # Сначала все запросы, потом следующий прогон — между повторами больше времени
+    for run_number in range(1, runs + 1):
+        for number, query in enumerate(queries, 1):
+            info = summary[query]
+            seen_now = set()
+            position = 0
+            for page in range(pages):
+                if not first_request and delay:
+                    time.sleep(delay)
+                first_request = False
+                prefix = f"[{number}/{len(queries)}] «{query}», стр. {page + 1}"
+                if runs > 1:
+                    prefix = f"[прогон {run_number}/{runs}] {prefix}"
+                try:
+                    response = session.get(
+                        BASE_URL, params={"text": query, "p": page, "lr": region}, timeout=30
+                    )
+                    response.raise_for_status()
+                except requests.RequestException as exc:
+                    _problem(info, "error", str(exc))
+                    log(f"{prefix}: ошибка сети — {exc}", "red")
+                    break
 
-            if save_html:
-                safe_name = re.sub(r"[^\w-]+", "_", query)[:60]
-                path = Path(save_html) / f"{number:03d}_{safe_name}_p{page + 1}.html"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(response.text, encoding="utf-8")
+                if save_html:
+                    safe_name = re.sub(r"[^\w-]+", "_", query)[:60]
+                    run_suffix = f"_r{run_number}" if runs > 1 else ""
+                    path = Path(save_html) / f"{number:03d}_{safe_name}_p{page + 1}{run_suffix}.html"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(response.text, encoding="utf-8")
 
-            parsed = parse_page(response.text, response.url)
-            info["pages"] = page + 1
+                parsed = parse_page(response.text, response.url)
+                info["pages"] = max(info["pages"], page + 1)
 
-            if not parsed["ads"]:
-                # На первой странице пустой ответ — результат запроса; дальше — конец
-                # списка объявлений. Капча — ошибка на любой странице.
-                if page == 0 or parsed["status"] == "captcha":
-                    info.update(status=parsed["status"], message=STATUS_MESSAGES[parsed["status"]])
-                    log(f"{prefix}: {info['message']}")
-                else:
-                    log(f"{prefix}: объявления закончились.")
-                break
+                if not parsed["ads"]:
+                    # На первой странице пустой ответ — результат запроса; дальше — конец
+                    # списка объявлений. Капча — ошибка на любой странице.
+                    status = parsed["status"]
+                    if status == "captcha" or (page == 0 and status == "unexpected"):
+                        _problem(info, status, STATUS_MESSAGES[status])
+                        log(f"{prefix}: {STATUS_MESSAGES[status]}", "red")
+                    elif page == 0:
+                        log(f"{prefix}: {STATUS_MESSAGES['no_ads']}", "yellow")
+                    else:
+                        log(f"{prefix}: объявления закончились.", "dim")
+                    break
 
-            for ad in parsed["ads"]:
-                info["ads"] += 1
-                all_ads.append({"query": query, "page": page + 1, "position": info["ads"], **ad})
-            info["status"] = "ok"
-            log(f"{prefix}: объявлений — {len(parsed['ads'])}")
-    return all_ads, summary
+                for ad in parsed["ads"]:
+                    position += 1
+                    key = (query, ad["domain"], ad["title"], ad["description"])
+                    known = merged.get(key)
+                    if known is None:
+                        known = merged[key] = {"query": query, "page": page + 1,
+                                               "position": position, "seen": 0, **ad}
+                    elif position < known["position"]:
+                        known.update(page=page + 1, position=position)
+                    if key not in seen_now:
+                        seen_now.add(key)
+                        known["seen"] += 1
+                log(f"{prefix}: объявлений — {len(parsed['ads'])}", "green")
 
+            if seen_now:
+                info["runs_with_ads"] += 1
+                if info["status"] == "no_ads":
+                    info["status"] = "ok"
+
+    order = {query: index for index, query in enumerate(queries)}
+    ads = sorted(merged.values(), key=lambda ad: (order[ad["query"]], ad["position"]))
+    for info in summary.values():
+        info["ads"] = sum(1 for ad in ads if ad["query"] == info["query"])
+        if info["status"] == "no_ads":
+            info["message"] = STATUS_MESSAGES["no_ads"]
+    return ads, list(summary.values())
+
+
+# ---------- Сохранение ----------
 
 def _cell(value):
     """Список (быстрые ссылки) в одну ячейку таблицы."""
     return " | ".join(value) if isinstance(value, list) else value
 
 
-def _write_json(target, ads, summary, region):
-    json.dump({"region": region, "queries": summary, "ads": ads}, target,
+def _write_json(target, ads, summary, region, runs):
+    json.dump({"region": region, "runs": runs, "queries": summary, "ads": ads}, target,
               ensure_ascii=False, indent=2)
     target.write("\n")
 
@@ -284,8 +383,9 @@ def _write_csv(path, ads):
 def _write_xlsx(path, ads, summary):
     workbook = Workbook()
     sheets = (
-        (workbook.active, "Объявления", AD_COLUMNS, ads, (30, 10, 10, 25, 60, 80, 60, 10, 40)),
-        (workbook.create_sheet(), "Запросы", QUERY_COLUMNS, summary, (30, 12, 12, 12, 90)),
+        (workbook.active, "Объявления", AD_COLUMNS, ads,
+         (30, 10, 10, 12, 25, 60, 80, 60, 10, 40)),
+        (workbook.create_sheet(), "Запросы", QUERY_COLUMNS, summary, (30, 12, 14, 12, 12, 90)),
     )
     for sheet, title, columns, rows, widths in sheets:
         sheet.title = title
@@ -299,30 +399,37 @@ def _write_xlsx(path, ads, summary):
     workbook.save(path)
 
 
-def write_output(output, ads, summary, region):
+def write_output(output, ads, summary, region, runs=1):
     if output == "-":
-        _write_json(sys.stdout, ads, summary, region)
+        _write_json(sys.stdout, ads, summary, region, runs)
         return
     suffix = Path(output).suffix.lower()
     if suffix == ".json":
         with open(output, "w", encoding="utf-8") as f:
-            _write_json(f, ads, summary, region)
+            _write_json(f, ads, summary, region, runs)
     elif suffix == ".csv":
         _write_csv(output, ads)
     else:
         _write_xlsx(output, ads, summary)
 
 
-def _output_problem(output):
-    """Проверяет до начала сбора, что результат получится сохранить. Иначе файл,
-    открытый в Excel (Windows не даёт в него писать), обнаружится только в конце,
-    и все запросы к Яндексу придётся повторять. Возвращает текст проблемы или None."""
+def default_output():
+    return str(RESULTS_DIR / time.strftime("ads_%Y-%m-%d_%H-%M-%S.xlsx"))
+
+
+def _prepare_output(output):
+    """Проверяет до начала сбора, что результат получится сохранить, и создаёт папку
+    results. Иначе файл, открытый в Excel (Windows не даёт в него писать), обнаружится
+    только в конце, и все запросы к Яндексу придётся повторять.
+    Возвращает текст проблемы или None."""
     if output == "-":
         return None
     path = Path(output)
     if path.suffix.lower() not in OUTPUT_FORMATS:
         return f"Поддерживаются {', '.join(OUTPUT_FORMATS)} или '-'."
     try:
+        if path.parent.resolve() == RESULTS_DIR:
+            RESULTS_DIR.mkdir(exist_ok=True)
         if path.exists():
             with open(path, "r+b"):
                 pass
@@ -333,24 +440,32 @@ def _output_problem(output):
     return None
 
 
-def run(queries, region=225, pages=1, output="ads_results.xlsx", delay=1.0, proxy=None,
+def _duration(seconds):
+    return f"{round(seconds)} с" if seconds < 90 else f"{round(seconds / 60)} мин"
+
+
+def run(queries, region=225, pages=1, runs=1, output=None, delay=1.0, proxy=None,
         save_html=None):
     """Собирает объявления, сохраняет результат, пишет итог. Возвращает код выхода."""
+    output = output or default_output()
+    requests_count = len(queries) * pages * runs
+    log(f"Запросов к Яндексу: до {requests_count}, это около "
+        f"{_duration(requests_count * (delay + SECONDS_PER_REQUEST))}.", "dim")
     ads, summary = collect(make_session(proxy), queries, pages=pages, region=region,
-                           delay=delay, save_html=save_html)
+                           delay=delay, runs=runs, save_html=save_html)
     try:
-        write_output(output, ads, summary, region)
+        write_output(output, ads, summary, region, runs)
     except OSError as exc:
-        log(f"Не удалось сохранить результат: {exc}")
+        log(f"Не удалось сохранить результат: {exc}", "red")
         return EXIT_ERRORS
 
     where = "stdout" if output == "-" else Path(output).resolve()
-    log(f"Готово: запросов {len(queries)}, объявлений {len(ads)} → {where}")
+    log(f"Готово: запросов {len(queries)}, объявлений {len(ads)} → {where}", "bold", "green")
 
     if any(info["status"] in ERROR_STATUSES for info in summary):
         return EXIT_ERRORS
     if not ads:
-        log("Объявлений нет. Они сильно зависят от региона — попробуйте другой регион.")
+        log("Объявлений нет. Они сильно зависят от региона — попробуйте другой регион.", "yellow")
         return EXIT_NO_ADS
     return EXIT_OK
 
@@ -366,89 +481,117 @@ def _clean_path(value):
     return value
 
 
+def _prompt(label, default):
+    return f"{paint(label, 'bold', stream=sys.stdout)} {paint(f'[{default}]', 'dim', stream=sys.stdout)}: "
+
+
 def _ask_until(ask, prompt, convert):
     """Переспрашивает, пока convert не примет ответ (ValueError — показать и спросить снова)."""
     while True:
         try:
             return convert(ask(prompt).strip())
         except ValueError as exc:
-            print(f"  {exc}")
+            say(f"  {exc}", "yellow")
 
 
-def _parse_pages(value):
+def _parse_number(value, default, maximum=None):
     if not value:
-        return 1
-    if not value.isdigit() or int(value) < 1:
-        raise ValueError("Нужно целое число от 1.")
+        return default
+    if not value.isdigit() or int(value) < 1 or (maximum and int(value) > maximum):
+        raise ValueError(f"Нужно целое число от 1{f' до {maximum}' if maximum else ''}.")
     return int(value)
 
 
 def _parse_output(value, default):
-    value = _clean_path(value) or default
-    if not Path(value).suffix:
-        value += ".xlsx"
-    problem = _output_problem(value)
+    """Пустой ответ — файл по умолчанию; просто имя — в папку results; путь — как указан."""
+    value = _clean_path(value)
+    if not value:
+        path = Path(default)
+    elif any(sep and sep in value for sep in (os.sep, os.altsep)):
+        path = Path(value)
+    else:
+        path = RESULTS_DIR / value
+    if not path.suffix:
+        path = path.with_name(path.name + ".xlsx")
+    problem = _prepare_output(str(path))
     if problem:
         raise ValueError(problem)
-    return value
+    return str(path)
 
 
 def _ask_queries(ask):
-    print("Запросы — по одному на строку, в конце пустая строка.\n"
-          "Если запросов много, укажите путь к текстовому файлу с ними "
-          "(можно перетащить файл в это окно).")
+    say("Запросы — по одному на строку, в конце пустая строка.", "bold")
+    say("Если запросов много, укажите путь к текстовому файлу с ними "
+        "(можно перетащить файл в это окно).", "dim")
     while True:
         first = ask("").strip()
         if not first:
-            print("  Нужен хотя бы один запрос.")
+            say("  Нужен хотя бы один запрос.", "yellow")
             continue
         path = Path(_clean_path(first))
         if path.is_file():
             try:
                 queries = read_queries([], str(path))
             except OSError as exc:
-                print(f"  Не удалось прочитать файл: {exc}")
+                say(f"  Не удалось прочитать файл: {exc}", "yellow")
                 continue
             if not queries:
-                print("  В файле нет запросов.")
+                say("  В файле нет запросов.", "yellow")
                 continue
-            print(f"  Из файла взято запросов: {len(queries)}.")
+            say(f"  Из файла взято запросов: {len(queries)}.", "green")
             return queries
         lines = [first]
         while line := ask("").strip():
             lines.append(line)
         queries = read_queries(lines)
-        print(f"  Запросов: {len(queries)}.")
+        say(f"  Запросов: {len(queries)}.", "green")
         return queries
 
 
 def interactive(ask=input):
     """Пошаговый режим для человека: вопросы вместо флагов."""
-    print("Сбор объявлений Яндекс.Директа.\n"
-          "В квадратных скобках — значение по умолчанию, для него просто нажмите Enter. "
-          "Выход — Ctrl+C.\n")
+    say("Сбор объявлений Яндекс.Директа", "bold", "cyan")
+    say("В квадратных скобках — значение по умолчанию, для него просто нажмите Enter. "
+        "Выход — Ctrl+C.\n", "dim")
     try:
         queries = _ask_queries(ask)
 
-        print("\nРегион — код или название города. Популярные: 225 Россия, 213 Москва, "
-              "1 Москва и область, 2 Санкт-Петербург, 54 Екатеринбург, 43 Казань, "
-              f"35 Краснодар, 36 Ставрополь.\nВсе коды регионов: {REGIONS_DOC}")
-        region = _ask_until(ask, "Регион [225 — Россия]: ", lambda v: parse_region(v or "225"))
+        say()
+        say("Регион — код или название города. Популярные: 225 Россия, 213 Москва, "
+            "1 Москва и область, 2 Санкт-Петербург, 54 Екатеринбург, 43 Казань, "
+            "35 Краснодар, 36 Ставрополь.", "dim")
+        say(f"Все коды регионов: {REGIONS_DOC}", "dim")
+        region = _ask_until(ask, _prompt("Регион", "225 — Россия"),
+                            lambda v: parse_region(v or "225"))
         name = _REGION_NAMES.get(region)
-        print(f"  Регион: {name} ({region})." if name else
-              f"  Регион: код {region} — его нет среди популярных, сверьтесь со справочником.")
+        if name:
+            say(f"  Регион: {name} ({region}).", "green")
+        else:
+            say(f"  Регион: код {region} — его нет среди популярных, сверьтесь со справочником.",
+                "yellow")
 
-        pages = _ask_until(ask, "\nСколько страниц объявлений на запрос (на странице до 10) [1]: ",
-                           _parse_pages)
+        say()
+        pages = _ask_until(ask, _prompt("Сколько страниц объявлений на запрос (на странице до 10)", 1),
+                           lambda v: _parse_number(v, 1))
 
-        default = time.strftime("ads_%Y-%m-%d_%H-%M.xlsx")
-        output = _ask_until(ask, f"\nКуда сохранить (.xlsx, .csv или .json) [{default}]: ",
+        say()
+        say("Прогоны — повторные сборы: Яндекс каждый раз показывает немного разный набор "
+            f"объявлений, и несколько прогонов дают более полный список. Обычно хватает 3–5, "
+            f"максимум {MAX_RUNS}.", "dim")
+        runs = _ask_until(ask, _prompt("Сколько прогонов", 1),
+                          lambda v: _parse_number(v, 1, MAX_RUNS))
+
+        say()
+        default = default_output()
+        shown = Path(default).relative_to(RESULTS_DIR.parent)
+        say("Просто имя файла — сохраню в папку results, полный путь — куда укажете.", "dim")
+        output = _ask_until(ask, _prompt("Куда сохранить (.xlsx, .csv или .json)", shown),
                             lambda v: _parse_output(v, default))
     except EOFError:
-        print("\nОтменено.")
+        say("\nОтменено.", "yellow")
         return EXIT_USAGE
-    print()
-    return run(queries, region=region, pages=pages, output=output)
+    say()
+    return run(queries, region=region, pages=pages, runs=runs, output=output)
 
 
 # ---------- Режим с аргументами (для скриптов и агентов) ----------
@@ -469,7 +612,7 @@ def build_parser():
         epilog=f"""примеры:
   python main.py                              пошаговый режим
   python main.py "купить духи" "парфюм магазин"
-  python main.py -f queries.txt -p 2 -r Москва -o ads.xlsx
+  python main.py -f queries.txt -p 2 -r Москва --runs 3 -o ads.xlsx
   python main.py -f queries.txt -r 36 -o -    JSON в stdout (удобно агенту)
   cat queries.txt | python main.py -f - -o ads.csv
 
@@ -481,6 +624,10 @@ def build_parser():
 54 — Екатеринбург, 36 — Ставрополь. Объявления сильно зависят от региона.
 Все коды: {REGIONS_DOC}
 
+прогоны (--runs): Яндекс каждый раз показывает немного разный набор объявлений.
+Прогоны объединяются: одинаковые объявления склеиваются, в колонке «Встречалось
+в прогонах» видно, как часто объявление показывалось. Обычно хватает 3–5.
+
 статусы запросов: ok — объявления есть; no_ads — Яндекс ответил «ничего не нашлось»;
 captcha — капча; unexpected — незнакомая страница (вёрстка поменялась?);
 error — ошибка сети.
@@ -490,7 +637,9 @@ error — ошибка сети.
   1 — капча, ошибка сети или незнакомая вёрстка хотя бы по одному запросу
       (собранное всё равно сохраняется)
   2 — неверные аргументы или результат некуда сохранить
-  3 — ошибок нет, но объявлений ноль""",
+  3 — ошибок нет, но объявлений ноль
+
+цвет в терминале выключается переменной окружения NO_COLOR=1.""",
     )
     parser.add_argument("queries", nargs="*", metavar="QUERY", help="поисковые запросы")
     parser.add_argument("-f", "--file", help="файл с запросами, по одному на строку ('-' — stdin)")
@@ -498,9 +647,12 @@ error — ошибка сети.
                         help="сколько страниц объявлений брать на запрос (по умолчанию 1)")
     parser.add_argument("-r", "--region", type=_region_arg, default=225,
                         help="код региона lr или название города (по умолчанию 225 — Россия)")
-    parser.add_argument("-o", "--output", default="ads_results.xlsx",
+    parser.add_argument("--runs", type=int, default=1,
+                        help=f"сколько прогонов сделать и объединить, от 1 до {MAX_RUNS} "
+                             "(по умолчанию 1)")
+    parser.add_argument("-o", "--output",
                         help="куда сохранить: .xlsx, .csv или .json; '-' — JSON в stdout "
-                             "(по умолчанию ads_results.xlsx)")
+                             "(по умолчанию results/ads_<дата>_<время>.xlsx рядом с программой)")
     parser.add_argument("--delay", type=float, default=1.0,
                         help="пауза между запросами к Яндексу, сек (по умолчанию 1)")
     parser.add_argument("--proxy", help="прокси, например http://user:pass@host:port "
@@ -523,21 +675,25 @@ def main(argv=None):
                      "(без аргументов в терминале запускается пошаговый режим)")
     if args.pages < 1:
         parser.error("--pages должно быть не меньше 1")
-    problem = _output_problem(args.output)
+    if not 1 <= args.runs <= MAX_RUNS:
+        parser.error(f"--runs должно быть от 1 до {MAX_RUNS}")
+    output = args.output or default_output()
+    problem = _prepare_output(output)
     if problem:
         parser.error(f"--output: {problem}")
 
-    return run(queries, region=args.region, pages=args.pages, output=args.output,
+    return run(queries, region=args.region, pages=args.pages, runs=args.runs, output=output,
                delay=args.delay, proxy=args.proxy, save_html=args.save_html)
 
 
 if __name__ == "__main__":
     _utf8_stdio()
+    _enable_ansi()
     if _launched_interactively():
         try:
             code = interactive()
         except KeyboardInterrupt:
-            print("\nОстановлено.")
+            say("\nОстановлено.", "yellow")
             code = 130
         _pause()
         sys.exit(code)

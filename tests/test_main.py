@@ -191,6 +191,53 @@ def test_read_queries_windows_encodings(tmp_path, encoding):
     assert main.read_queries([], str(path)) == ["купить духи", "парфюм магазин"]
 
 
+def make_excel(path, first_column, second_column=()):
+    from openpyxl import Workbook
+    workbook = Workbook()
+    for row, value in enumerate(first_column, 1):
+        workbook.active.cell(row=row, column=1, value=value)
+    for row, value in enumerate(second_column, 1):
+        workbook.active.cell(row=row, column=2, value=value)
+    workbook.create_sheet("Другой лист").append(["не запрос"])
+    workbook.save(path)
+    return path
+
+
+def test_read_queries_from_excel_first_column(tmp_path):
+    path = make_excel(tmp_path / "запросы.xlsx",
+                      ["Ключевые слова", "купить духи", None, "парфюм магазин", 2026],
+                      ["Частота", "100", "", "50"])
+    # заголовок пропущен, пустая клетка тоже, второй лист и вторая колонка не читаются
+    assert main.read_queries([], str(path)) == ["купить духи", "парфюм магазин", "2026"]
+
+
+def test_read_queries_from_csv_with_semicolons(tmp_path):
+    path = tmp_path / "запросы.csv"
+    # так сохраняет CSV Excel в русской Windows: «;» и cp1251
+    path.write_bytes("Запрос;Частота\r\nкупить духи, недорого;100\r\nпарфюм магазин;50\r\n"
+                     .encode("cp1251"))
+    assert main.read_queries([], str(path)) == ["купить духи, недорого", "парфюм магазин"]
+
+
+@pytest.mark.parametrize("data, message", [
+    (b"\xd0\xcf\x11\xe0" + b"\x00" * 100, "старый формат Excel"),
+    (b"PK\x03\x04" + b"\x00" * 100, "не таблица Excel и не текст"),
+    (b"\x89PNG\r\n\x1a\n\x00\x00", "не текстовый файл"),
+])
+def test_read_queries_rejects_other_files(tmp_path, data, message):
+    path = tmp_path / "файл"
+    path.write_bytes(data)
+    with pytest.raises(ValueError, match=message):
+        main.read_queries([], str(path))
+
+
+def test_cli_reads_queries_from_excel(monkeypatch, tmp_path):
+    session = FakeSession([ADS_PAGE])
+    excel = make_excel(tmp_path / "q.xlsx", ["Запрос", "окна", "двери"])
+    run_cli(monkeypatch, session, "-f", str(excel), "-o", str(tmp_path / "out.json"))
+    assert [call["text"] for call in session.calls] == ["окна", "двери"]
+
+
 def test_read_queries_from_stdin(monkeypatch):
     stdin = io.TextIOWrapper(io.BytesIO("купить духи\nпарфюм магазин\n".encode("utf-8")))
     monkeypatch.setattr(sys, "stdin", stdin)
@@ -502,6 +549,11 @@ def test_missing_dependency_is_explained():
 
 # ---------- ручной режим: два вопроса и карточка ----------
 
+def asked(session):
+    """Какие запросы ушли в Яндекс — без повторов прогонов, по порядку."""
+    return list(dict.fromkeys(call["text"] for call in session.calls))
+
+
 def start_interactive(monkeypatch, session, *values):
     use_session(monkeypatch, session)
     monkeypatch.setattr(main.time, "sleep", lambda seconds: None)
@@ -516,13 +568,15 @@ def test_interactive_two_questions_and_start(monkeypatch, capsys):
     code, opened = start_interactive(monkeypatch, session, "купить духи", "парфюм магазин",
                                      "", "", "Ставрополь", "")
     assert code == main.EXIT_OK
+    # по умолчанию в ручном режиме — 3 прогона
     assert [(c["text"], c["p"], c["lr"]) for c in session.calls] == [
-        ("купить духи", 0, 36), ("парфюм магазин", 0, 36)]
+        ("купить духи", 0, 36), ("парфюм магазин", 0, 36)] * main.INTERACTIVE_RUNS
     printed = capsys.readouterr().out
     assert "Шаг 1 из 2" in printed and "Шаг 2 из 2" in printed
     assert "1. Запросы: 2 (купить духи, парфюм магазин)" in printed
     assert "2. Город: Ставрополь (36)" in printed
-    assert "обращений к Яндексу — до 2" in printed
+    assert "3. Полнота: прогонов — 3, страниц на запрос — 1" in printed
+    assert "обращений к Яндексу — до 6" in printed
     assert len(list(main.RESULTS_DIR.glob("ads_*.xlsx"))) == 1
     assert opened == []  # на «Открыть таблицу?» ответа не было (EOF) — не открываем
 
@@ -561,13 +615,20 @@ def test_interactive_reasks_with_helpful_messages(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("typed, code", [
-    ("36 Ставрополь", 36), ("мск", 213), ("краснадар", 35), ("", 225),
+    ("36 Ставрополь", 36), ("мск", 213), ("краснадар", 35), ("Россия", 225),
 ])
 def test_interactive_region_forms(monkeypatch, typed, code):
     session = FakeSession([ADS_PAGE])
     extra = ("",) if typed == "краснадар" else ()  # «Может быть, Краснодар?» — да
     start_interactive(monkeypatch, session, "окна", "", "", typed, *extra, "")
     assert session.calls[0]["lr"] == code
+
+
+def test_interactive_city_is_required(monkeypatch, capsys):
+    session = FakeSession([ADS_PAGE])
+    start_interactive(monkeypatch, session, "окна", "", "", "", "Россия", "")
+    assert "Укажите город" in capsys.readouterr().out
+    assert session.calls[0]["lr"] == 225
 
 
 def test_interactive_region_list_and_unknown_code(monkeypatch, capsys):
@@ -582,22 +643,21 @@ def test_interactive_region_list_and_unknown_code(monkeypatch, capsys):
 def test_interactive_paste_with_blank_line_keeps_all_queries(monkeypatch):
     session = FakeSession([ADS_PAGE])
     start_interactive(monkeypatch, session, "а", "б", "", "в", "", "", "36", "")
-    assert [c["text"] for c in session.calls] == ["а", "б", "в"]
+    assert asked(session) == ["а", "б", "в"]
 
 
 def test_interactive_multiline_paste_in_one_input(monkeypatch):
     # readline со «вставкой целиком» отдаёт сразу несколько строк
     session = FakeSession([ADS_PAGE])
     start_interactive(monkeypatch, session, "а\nб\n\nв", "", "", "36", "")
-    assert [c["text"] for c in session.calls] == ["а", "б", "в"]
+    assert asked(session) == ["а", "б", "в"]
 
 
 def test_interactive_comma_separated_queries_can_be_split(monkeypatch):
     session = FakeSession([ADS_PAGE])
     start_interactive(monkeypatch, session, "купить духи, парфюм магазин, туалетная вода",
                       "", "", "", "36", "")
-    assert [c["text"] for c in session.calls] == [
-        "купить духи", "парфюм магазин", "туалетная вода"]
+    assert asked(session) == ["купить духи", "парфюм магазин", "туалетная вода"]
 
 
 def test_interactive_queries_from_dragged_file(monkeypatch, tmp_path):
@@ -606,19 +666,29 @@ def test_interactive_queries_from_dragged_file(monkeypatch, tmp_path):
     queries.write_text("купить духи\nпарфюм магазин\n", encoding="utf-8")
     # Windows при перетаскивании файла в окно берёт путь в кавычки
     start_interactive(monkeypatch, session, f'"{queries}"', "", "", "213", "")
-    assert [c["text"] for c in session.calls] == ["купить духи", "парфюм магазин"]
+    assert asked(session) == ["купить духи", "парфюм магазин"]
 
 
-def test_interactive_file_typos_and_excel_are_not_queries(monkeypatch, tmp_path, capsys):
+def test_interactive_file_typos_and_broken_files_are_not_queries(monkeypatch, tmp_path,
+                                                                    capsys):
     session = FakeSession([ADS_PAGE])
-    excel = tmp_path / "запросы.xlsx"
-    excel.write_bytes(b"PK\x03\x04" + b"\x00" * 100)  # xlsx внутри — zip-архив
-    start_interactive(monkeypatch, session, "/нет/такого/queris.txt", str(excel), "окна",
+    broken = tmp_path / "отчёт.docx"
+    broken.write_bytes(b"PK\x03\x04" + b"\x00" * 100)  # zip-архив, но не таблица
+    start_interactive(monkeypatch, session, "/нет/такого/queris.txt", str(broken), "окна",
                       "", "", "36", "")
     printed = capsys.readouterr().out
     assert "Файл не найден: /нет/такого/queris.txt" in printed
-    assert "не текстовый файл" in printed
-    assert [c["text"] for c in session.calls] == ["окна"]
+    assert "не таблица Excel и не текст" in printed
+    assert asked(session) == ["окна"]
+
+
+def test_interactive_queries_from_dragged_excel(monkeypatch, tmp_path, capsys):
+    session = FakeSession([ADS_PAGE])
+    excel = make_excel(tmp_path / "запросы.xlsx", ["Ключевые слова", "купить духи",
+                                                    "парфюм магазин"])
+    start_interactive(monkeypatch, session, str(excel), "", "", "36", "")
+    assert "Из файла «запросы.xlsx» взято запросов: 2" in capsys.readouterr().out
+    assert asked(session) == ["купить духи", "парфюм магазин"]
 
 
 def test_interactive_finds_file_next_to_the_program(monkeypatch, tmp_path):
@@ -628,7 +698,7 @@ def test_interactive_finds_file_next_to_the_program(monkeypatch, tmp_path):
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)  # программа запущена не из своей папки
     start_interactive(monkeypatch, session, "queries.txt", "", "", "36", "")
-    assert [c["text"] for c in session.calls] == ["окна"]
+    assert asked(session) == ["окна"]
 
 
 def test_interactive_output_folder_existing_file_and_wrong_format(monkeypatch, tmp_path,

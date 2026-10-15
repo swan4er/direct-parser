@@ -11,6 +11,7 @@ import argparse
 import codecs
 import csv
 import difflib
+import io
 import json
 import os
 import re
@@ -76,7 +77,7 @@ def _offer_install(missing):
 try:
     import requests
     from bs4 import BeautifulSoup
-    from openpyxl import Workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
     from openpyxl.styles import Font
     from requests.adapters import HTTPAdapter
@@ -273,15 +274,56 @@ def clean_text(text):
     return " ".join(_CONTROL_CHARS.sub(" ", _KEY_CODES.sub("", text)).split())
 
 
-def _file_text(path):
-    """Текст файла запросов. Excel и другие не текстовые файлы — понятная ошибка
-    (ValueError), а не сотни «запросов» из байтов архива."""
-    data = Path(path).read_bytes()
+# Строка-заголовок над списком в таблице — не запрос
+_HEADER_WORDS = {"запрос", "запросы", "ключевой запрос", "ключевые запросы", "ключевое слово",
+                 "ключевые слова", "ключевая фраза", "ключевые фразы", "фраза", "фразы",
+                 "keyword", "keywords", "query", "queries"}
+_FILE_HELP = ("Нужен .txt с запросами по одному на строку или таблица Excel (.xlsx) "
+              "с запросами в первой колонке.")
+
+
+def _first_column(rows):
+    """Первая колонка таблицы: пустые клетки и строка-заголовок («Запрос»…) пропускаются."""
+    values = [str(row[0]).strip() for row in rows
+              if row and row[0] is not None and str(row[0]).strip()]
+    if values and _norm(values[0]) in _HEADER_WORDS:
+        values = values[1:]
+    return values
+
+
+def _csv_delimiter(first_line, suffix):
+    # Excel в русской Windows сохраняет CSV через «;»
+    if suffix == ".tsv":
+        return "\t"
+    return max((";", "\t", ","), key=first_line.count)
+
+
+def _file_lines(path):
+    """Запросы из файла: текст — по строке, Excel (первый лист) и CSV — первая колонка.
+    Прочие файлы — понятная ошибка (ValueError), а не сотни «запросов» из байтов."""
+    path = Path(path)
+    data = path.read_bytes()
+    if data.startswith(b"PK\x03\x04"):  # .xlsx внутри — zip-архив
+        try:
+            workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        except Exception:  # openpyxl на чужих архивах бросает очень разное
+            raise ValueError(f"«{path.name}» — не таблица Excel и не текст. {_FILE_HELP}") from None
+        try:
+            return _first_column(workbook.worksheets[0].iter_rows(values_only=True))
+        finally:
+            workbook.close()
+    if data.startswith(b"\xd0\xcf\x11\xe0"):
+        raise ValueError(f"«{path.name}» — старый формат Excel (.xls). "
+                         "Сохраните таблицу как .xlsx или .txt.")
     utf16 = data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
-    if not utf16 and (data.startswith(b"PK\x03\x04") or b"\x00" in data[:4096]):
-        raise ValueError(f"«{Path(path).name}» — не текстовый файл. Нужен .txt с запросами "
-                         "по одному на строку (в Excel: «Сохранить как» → «Текст»).")
-    return _decode(data)
+    if not utf16 and b"\x00" in data[:4096]:
+        raise ValueError(f"«{path.name}» — не текстовый файл. {_FILE_HELP}")
+    text = _decode(data)
+    if path.suffix.lower() in (".csv", ".tsv"):
+        lines = text.splitlines()
+        delimiter = _csv_delimiter(lines[0] if lines else "", path.suffix.lower())
+        return _first_column(csv.reader(lines, delimiter=delimiter))
+    return text.splitlines()
 
 
 def read_queries(arg_queries, file_path=None):
@@ -291,7 +333,7 @@ def read_queries(arg_queries, file_path=None):
     if file_path == "-":
         lines += _decode(sys.stdin.buffer.read()).splitlines()
     elif file_path:
-        lines += _file_text(file_path).splitlines()
+        lines += _file_lines(file_path)
     cleaned = (clean_text(line) for line in lines)
     return list(dict.fromkeys(q for q in cleaned if q and not q.startswith("#")))
 
@@ -661,8 +703,12 @@ HINTS = {
                    "parse_page().",
                    "Незнакомые страницы сохранены в папке results/debug — отправьте их "
                    "разработчику."),
-    "no_ads": ("Объявления сильно зависят от региона — попробуйте другой (-r).",
-               "Объявления сильно зависят от города — попробуйте другой."),
+    # Пусто бывает и тогда, когда Яндекс сам не показывает рекламу (так было при сбое
+    # в октябре 2026), — честно называем обе причины
+    "no_ads": ("Объявления сильно зависят от региона — попробуйте другой (-r). Если пусто "
+               "везде, Яндекс, возможно, временно не показывает рекламу — повторите позже.",
+               "Объявления сильно зависят от города — попробуйте другой. Если пусто везде, "
+               "возможно, Яндекс временно не показывает рекламу — повторите позже."),
 }
 
 
@@ -721,10 +767,9 @@ def run(queries, region=225, pages=1, runs=1, output=None, delay=1.0, proxy=None
 # ---------- Ручной режим (python main.py без аргументов) ----------
 
 # Значения по умолчанию в карточке перед стартом
-INTERACTIVE_RUNS = 1
+INTERACTIVE_RUNS = 3  # человеку — полнее список; агенту по умолчанию 1 (--runs)
 INTERACTIVE_PAGES = 1
 MAX_PAGES = 10  # дальше 2–3 страниц реклама почти никогда не идёт
-DEFAULT_REGION = 225  # Enter в вопросе о городе — вся Россия
 
 # Ввод, похожий на путь к файлу, а не на поисковый запрос
 _FILE_SUFFIXES = (".txt", ".csv", ".tsv", ".xlsx", ".xlsm", ".xls", ".docx")
@@ -797,7 +842,8 @@ def _load_queries_file(path):
 
 def _ask_queries(ask):
     say("Введите поисковые запросы по одному на строку или перетащите в это окно файл "
-        "со списком (.txt). Когда закончите, нажмите Enter на пустой строке.", "dim")
+        "со списком: .txt или Excel (запросы в первой колонке). Когда закончите, нажмите "
+        "Enter на пустой строке.", "dim")
     queries = []
     while True:
         # Вставка из буфера через readline может прийти сразу несколькими строками
@@ -855,16 +901,22 @@ def _show_regions():
 
 
 def _ask_region(ask, current=None):
+    """Город обязателен: без него видна только реклама на всю страну. При правке
+    с карточки Enter оставляет текущий."""
     say("Реклама сильно зависит от города. Введите город или код региона Яндекса; "
-        "? — список городов.", "dim")
-    default = current or DEFAULT_REGION
+        "? — список городов, «Россия» — вся страна.", "dim")
+    prompt = f"Город [{_region_label(current)}]: " if current else "Город: "
     while True:
-        value = clean_text(ask(f"Город [{_region_label(default)}]: "))
+        value = clean_text(ask(prompt))
         if value == "?":
             _show_regions()
             continue
         if not value:
-            return default
+            if current:
+                return current
+            say("  Укажите город: без него Яндекс покажет только тех, кто рекламируется "
+                "на всю страну. Нужна вся Россия — введите «Россия».", "yellow")
+            continue
         number = _first_number(value)
         if number:  # «36», «36 Ставрополь»
             if number in _REGION_NAMES or _confirm(
@@ -1056,8 +1108,9 @@ def build_parser():
   python main.py -f queries.txt -r 36 -o -    JSON в stdout (удобно агенту)
   cat queries.txt | python main.py -f - -o ads.csv
 
-файл запросов: один запрос на строку, пустые строки и строки с # пропускаются;
-кодировка UTF-8, UTF-16 или cp1251 (ANSI) — определяется сама.
+файл запросов: текст — один запрос на строку, пустые строки и строки с # пропускаются,
+кодировка UTF-8, UTF-16 или cp1251 (ANSI) определяется сама; Excel (.xlsx) и CSV —
+первая колонка первого листа, строка-заголовок («Запрос», «Ключевые слова») пропускается.
 
 регион (-r) — код Яндекса (уходит в параметр lr) или название крупного города:
 225 — Россия, 213 — Москва, 1 — Москва и область, 2 — Санкт-Петербург,
@@ -1082,7 +1135,9 @@ error — ошибка сети.
 цвет в терминале выключается переменной окружения NO_COLOR=1.""",
     )
     parser.add_argument("queries", nargs="*", metavar="QUERY", help="поисковые запросы")
-    parser.add_argument("-f", "--file", help="файл с запросами, по одному на строку ('-' — stdin)")
+    parser.add_argument("-f", "--file",
+                        help="файл с запросами: текст (по запросу на строку), Excel или CSV "
+                             "(первая колонка); '-' — stdin")
     parser.add_argument("-p", "--pages", type=int, default=1,
                         help="сколько страниц объявлений брать на запрос (по умолчанию 1)")
     parser.add_argument("-r", "--region", type=_region_arg, default=225,
